@@ -56,6 +56,33 @@ function filterByPeriod(items,periodMode,periodVal,dateField='date'){
   });
 }
 
+// Todos los gastos = gastos operativos + compras
+// mode: 'devengado' incluye todas las compras (pagadas y a crédito)
+//       'caja' solo las de contado + créditos ya pagados
+function getAllExpenses(st,mode='caja'){
+  const ops=(st.expenses||[]).map(e=>({...e,source:'operativo',id:'e_'+e.id,orig_id:e.id}));
+  const purch=(st.purchases||[]).flatMap(p=>{
+    const payable=(st.payables||[]).find(pa=>pa.purchase_id===p.id);
+    const isCredit=!!payable;
+    const isPaid=!payable||payable.paid;
+    // Modo caja: solo aparece cuando efectivamente salió dinero
+    if(mode==='caja'&&isCredit&&!isPaid)return [];
+    const effectiveDate=(isCredit&&isPaid&&payable.paid_at)?payable.paid_at:p.date;
+    return [{
+      id:'p_'+p.id,orig_id:p.id,
+      source:'compra',
+      date:effectiveDate,
+      category:'Compras / Materia Prima',
+      description:`${p.supplier_name||''}${p.invoice_num?' — '+p.invoice_num:''}`,
+      amount_usd:p.total_usd,
+      is_credit:isCredit,
+      is_paid:isPaid,
+      ts:p.ts||0,
+    }];
+  });
+  return [...ops,...purch].sort((a,b)=>(b.date||'').localeCompare(a.date||'')||(b.ts||0)-(a.ts||0));
+}
+
 // Export to CSV
 // Descarga robusta: funciona en navegadores normales y dentro de iframes/artefactos.
 // El anchor DEBE estar en el DOM y el URL no puede revocarse de inmediato,
@@ -256,12 +283,52 @@ function reducer(st,ac){
 
     case'ADD_SALE':{
       const sale={...ac.p,ts:ac.p.ts||Date.now(),sold_by:st.current_user?.name||'—'};
+      const isAutoc=sale.sale_type==='autoconsumo';
+      const isCredit=sale.sale_type==='credit'||sale.sale_type==='wholesale_credit';
+      // Descuento de stock (siempre - incluso autoconsumo y crédito)
       const prods=st.products.map(p=>{const item=sale.items.find(i=>i.product_id===p.id);return item?{...p,stock:Math.max(0,p.stock-item.qty)}:p;});
-      const movs=sale.items.map(item=>({id:uid(),product_id:item.product_id,type:'salida',qty:item.qty,reason:'Venta',ref_id:sale.id,ref_type:'sale',date:sale.date,notes:'Factura venta'}));
-      // Update client stats
+      const reason=isAutoc?'Autoconsumo':isCredit?'Venta a crédito':'Venta';
+      const movs=sale.items.map(item=>({id:uid(),product_id:item.product_id,type:'salida',qty:item.qty,reason,ref_id:sale.id,ref_type:isAutoc?'autoconsumo':'sale',date:sale.date,notes:isAutoc?`Autoconsumo — ${sale.autoc_reason||''}`:`Factura ${sale.id.slice(-6)}`}));
+      // Cliente: acumular ventas + saldo de crédito si aplica
       let clients=st.clients;
-      if(sale.client_id){clients=clients.map(c=>c.id===sale.client_id?{...c,total_purchases:(c.total_purchases||0)+sale.total_usd,last_purchase:sale.date}:c);}
-      return{...st,products:prods,sales:[sale,...st.sales],inv_movements:[...movs,...st.inv_movements],clients,audit_log:[audit('VENTA',`$${f2(sale.total_usd)} - ${sale.client||'Mostrador'}`),...st.audit_log].slice(0,500)};
+      if(sale.client_id){
+        clients=clients.map(c=>{
+          if(c.id!==sale.client_id)return c;
+          const owed=isCredit?(sale.credit?.amount_owed||0):0;
+          return{...c,
+            total_purchases:(c.total_purchases||0)+sale.total_usd,
+            last_purchase:sale.date,
+            credit_balance:(c.credit_balance||0)+owed,
+          };
+        });
+      }
+      const actionType=isAutoc?'AUTOCONSUMO':isCredit?'VENTA_CREDITO':'VENTA';
+      const auditDetail=isAutoc?`${sale.autoc_reason||''} — $${f2(sale.total_usd)} · ${sale.items.length} art.`
+        :isCredit?`${sale.client} debe $${f2(sale.credit?.amount_owed||0)} (vence ${sale.credit?.due_date||''})`
+        :`$${f2(sale.total_usd)} - ${sale.client||'Mostrador'}`;
+      return{...st,products:prods,sales:[sale,...st.sales],inv_movements:[...movs,...st.inv_movements],clients,audit_log:[audit(actionType,auditDetail),...st.audit_log].slice(0,500)};
+    }
+
+    case'CREDIT_PAYMENT':{
+      // ac: {sale_id, payment: {id, date, amount_usd, method_id, method_name, notes, ts}}
+      const sale=st.sales.find(s=>s.id===ac.sale_id);
+      if(!sale||!sale.credit)return st;
+      const pay={...ac.payment,ts:ac.payment.ts||Date.now(),received_by:st.current_user?.name||'—'};
+      const newPayments=[...(sale.credit.payments||[]),pay];
+      const paidTotal=newPayments.reduce((a,p)=>a+p.amount_usd,0);
+      const newOwed=Math.max(0,sale.total_usd-sale.credit.paid_initial-paidTotal);
+      const isSettled=newOwed<0.01;
+      const sales=st.sales.map(s=>s.id===ac.sale_id
+        ?{...s,credit:{...s.credit,payments:newPayments,amount_owed:newOwed,settled_at:isSettled?nowISO():null}}
+        :s);
+      // Actualizar saldo del cliente
+      let clients=st.clients;
+      if(sale.client_id){
+        clients=clients.map(c=>c.id===sale.client_id
+          ?{...c,credit_balance:Math.max(0,(c.credit_balance||0)-pay.amount_usd)}
+          :c);
+      }
+      return{...st,sales,clients,audit_log:[audit('COBRO_CREDITO',`${sale.client} +$${f2(pay.amount_usd)} · ${pay.method_name||''}${isSettled?' (SALDADO)':''}`),...st.audit_log].slice(0,500)};
     }
 
     case'ADD_PURCHASE':{
@@ -413,7 +480,8 @@ const NAV=[
   {id:'productos',label:'Productos',icon:'🔖',group:'inv'},
   {id:'_fin',label:'FINANZAS',group:'header'},
   {id:'caja',label:'Cuadre de Caja',icon:'💰',group:'fin'},
-  {id:'gastos',label:'Gastos Operativos',icon:'💸',group:'fin'},
+  {id:'gastos',label:'Gastos',icon:'💸',group:'fin'},
+  {id:'cobros',label:'Cuentas por Cobrar',icon:'💳',group:'fin'},
   {id:'reportes',label:'Reportes',icon:'📊',group:'fin'},
   {id:'_sys',label:'SISTEMA',group:'header'},
   {id:'clientes',label:'Clientes',icon:'👥',group:'sys'},
@@ -421,8 +489,8 @@ const NAV=[
   {id:'config',label:'Configuración',icon:'⚙',group:'sys'},
 ];
 const ROLE_PAGES={
-  admin:['dashboard','formulas','produccion','ventas','compras','inventario','productos','caja','gastos','reportes','clientes','empleados','config'],
-  cajero:['dashboard','ventas','caja','clientes'],
+  admin:['dashboard','formulas','produccion','ventas','compras','inventario','productos','caja','gastos','cobros','reportes','clientes','empleados','config'],
+  cajero:['dashboard','ventas','caja','clientes','cobros'],
   produccion:['dashboard','formulas','produccion','inventario','productos'],
 };
 
@@ -521,12 +589,16 @@ function Dashboard({st,navigate}){
   // Expiry alerts
   const nearExpiry=st.products.filter(p=>{if(!p.expiry)return false;const d=new Date(p.expiry);const diff=(d-new Date())/(1000*60*60*24);return diff>=0&&diff<=7;});
 
+  // Cuentas por cobrar totales
+  const totalPorCobrar=(st.sales||[]).filter(s=>s.credit&&!s.credit.settled_at).reduce((a,s)=>a+(s.credit?.amount_owed||0),0);
+  const totalVencido=(st.sales||[]).filter(s=>s.credit&&!s.credit.settled_at&&s.credit?.due_date&&s.credit.due_date<todayISO()).reduce((a,s)=>a+(s.credit?.amount_owed||0),0);
+
   return(<div>
     <PageHeader title="Dashboard" sub="Panel de control y resumen ejecutivo"/>
     <PeriodSelector mode={period.mode} val={period} onChange={setPeriod}/>
 
     {/* Alerts */}
-    {(lowStock.length>0||nearExpiry.length>0)&&(<div style={{display:'flex',gap:10,marginBottom:16,flexWrap:'wrap'}}>
+    {(lowStock.length>0||nearExpiry.length>0||totalVencido>0)&&(<div style={{display:'flex',gap:10,marginBottom:16,flexWrap:'wrap'}}>
       {lowStock.length>0&&(<div style={{background:C.rL,border:`1.5px solid ${C.rT}`,borderRadius:10,padding:'10px 14px',display:'flex',gap:8,alignItems:'center',cursor:'pointer'}} onClick={()=>navigate('inventario')}>
         <span style={{fontWeight:700,color:C.r,fontSize:13}}>⚠️ {lowStock.length} productos bajo mínimo</span>
         {lowStock.slice(0,3).map(p=><Badge key={p.id} txt={p.name} color={C.r}/>)}
@@ -534,6 +606,9 @@ function Dashboard({st,navigate}){
       {nearExpiry.length>0&&(<div style={{background:C.aL,border:`1.5px solid ${C.aT}`,borderRadius:10,padding:'10px 14px',display:'flex',gap:8,alignItems:'center'}}>
         <span style={{fontWeight:700,color:C.a,fontSize:13}}>🗓 {nearExpiry.length} próximos a vencer</span>
         {nearExpiry.slice(0,3).map(p=><Badge key={p.id} txt={`${p.name}: ${p.expiry}`} color={C.a}/>)}
+      </div>)}
+      {totalVencido>0&&(<div style={{background:C.rL,border:`1.5px solid ${C.rT}`,borderRadius:10,padding:'10px 14px',display:'flex',gap:8,alignItems:'center',cursor:'pointer'}} onClick={()=>navigate('cobros')}>
+        <span style={{fontWeight:700,color:C.r,fontSize:13}}>⚠ ${fN(totalVencido)} en facturas vencidas por cobrar</span>
       </div>)}
     </div>)}
 
@@ -545,8 +620,9 @@ function Dashboard({st,navigate}){
       <KPICard label="Resultado Neto" value={`$${fN(netResult)}`} sub={netResult>=0?'Positivo en el período':'Negativo en el período'} icon={netResult>=0?'📈':'📉'} color={netResult>=0?C.g:C.r}/>
     </div>
     <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:14,marginBottom:20}}>
+      <KPICard label="💳 Por Cobrar" value={`$${fN(totalPorCobrar)}`} sub={totalVencido>0?`⚠ $${fN(totalVencido)} vencido`:'facturas pendientes'} icon="💳" color={totalVencido>0?C.r:C.a} onClick={()=>navigate('cobros')}/>
       <KPICard label="Panes Vendidos" value={totalPanes.toLocaleString()} sub={`${totalUnidades} unidades totales`} icon="🍞" color={C.a}/>
-      {st.payment_methods.map(pm=><KPICard key={pm.id} label={pm.name} value={`$${fN(byPM[pm.id]||0)}`} sub="recaudado" icon="💳" color={pm.color}/>)}
+      {st.payment_methods.slice(0,2).map(pm=><KPICard key={pm.id} label={pm.name} value={`$${fN(byPM[pm.id]||0)}`} sub="recaudado" icon="💳" color={pm.color}/>)}
     </div>
 
     {/* Charts Row */}
@@ -720,14 +796,15 @@ function Productos({st,dispatch}){
         </tbody>
       </table>
     </div>
-    {showForm&&editing&&<ProductForm p={editing} onSave={save} onClose={()=>{setShowForm(false);setEditing(null);}}/>}
+    {showForm&&editing&&<ProductForm p={editing} onSave={save} onClose={()=>{setShowForm(false);setEditing(null);}} isAdmin={st.current_role==='admin'}/>}
   </div>);
 }
 
-function ProductForm({p,onSave,onClose}){
+function ProductForm({p,onSave,onClose,isAdmin}){
   const[f,setF]=useState(p);
   const set=(k,v)=>setF(x=>({...x,[k]:v}));
   const margin=f.price&&f.cost?(f.price-f.cost)/f.price*100:null;
+  const sellable=f.type==='terminado'||f.type==='venta';
   return(<Modal title={p.code?`Editar: ${p.name}`:'Nuevo Producto'} onClose={onClose} footer={<><button style={bSc} onClick={onClose}>Cancelar</button><button style={bPr} onClick={()=>onSave(f)}>Guardar</button></>}>
     <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
       <div><label style={lbl}>Código</label><input style={inp} value={f.code} onChange={e=>set('code',e.target.value)}/></div>
@@ -737,15 +814,33 @@ function ProductForm({p,onSave,onClose}){
       <div style={{gridColumn:'1/-1'}}><label style={lbl}>Nombre</label><input style={inp} value={f.name} onChange={e=>set('name',e.target.value)}/></div>
       <div><label style={lbl}>Categoría</label><input style={inp} value={f.category} onChange={e=>set('category',e.target.value)} placeholder="Harinas, Bebidas..."/></div>
       <div><label style={lbl}>Unidad</label><select style={sel} value={f.unit} onChange={e=>set('unit',e.target.value)}>{['kg','g','lt','ml','und','saco','caja','bolsa','rollo'].map(u=><option key={u}>{u}</option>)}</select></div>
-      <div><label style={lbl}>Costo Unitario (USD)</label><input type="number" step="0.01" style={inp} value={f.cost} onChange={e=>set('cost',e.target.value)}/></div>
+      <div><label style={lbl}>Costo Unitario (USD)</label><input type="number" step="0.01" style={inp} value={f.cost} onChange={e=>set('cost',e.target.value)} disabled={!isAdmin}/></div>
       <div>
         <label style={lbl}>Precio de Venta (USD)</label>
-        <input type="number" step="0.01" style={inp} value={f.price||''} onChange={e=>set('price',e.target.value)} placeholder="Solo si se vende"/>
+        <input type="number" step="0.01" style={inp} value={f.price||''} onChange={e=>set('price',e.target.value)} placeholder="Solo si se vende" disabled={!isAdmin}/>
         {margin!==null&&<div style={{fontSize:11,color:margin>=30?C.g:C.r,marginTop:4}}>Margen: {f1(margin)}%</div>}
       </div>
       <div><label style={lbl}>Stock Actual</label><input type="number" step="0.01" style={inp} value={f.stock} onChange={e=>set('stock',e.target.value)}/></div>
       <div><label style={lbl}>Stock Mínimo</label><input type="number" step="0.01" style={inp} value={f.min_stock} onChange={e=>set('min_stock',e.target.value)}/></div>
       <div><label style={lbl}>Fecha de Vencimiento</label><input type="date" style={inp} value={f.expiry||''} onChange={e=>set('expiry',e.target.value)}/></div>
+      {sellable&&(<div style={{gridColumn:'1/-1',padding:12,background:C.pL,border:`1.5px solid ${C.p}44`,borderRadius:10,marginTop:4}}>
+        <div style={{fontSize:12,fontWeight:800,color:C.p,marginBottom:8,letterSpacing:'0.03em'}}>🏢 PRECIOS MAYORISTAS {!isAdmin&&<span style={{fontWeight:600,color:C.t3,fontSize:10,marginLeft:6}}>(solo lectura)</span>}</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
+          {[1,2,3].map(lvl=>{
+            const val=f['price_w'+lvl]||'';
+            const priceNum=Number(val);const margen=f.cost&&priceNum?(priceNum-f.cost)/priceNum*100:null;
+            return(<div key={lvl}>
+              <label style={{...lbl,fontSize:11}}>Precio {lvl}</label>
+              <input type="number" step="0.01" style={inp} value={val}
+                onChange={e=>set('price_w'+lvl,e.target.value)}
+                disabled={!isAdmin}
+                placeholder={f.price?f2(f.price*(lvl===1?0.9:lvl===2?0.85:0.8)):'0.00'}/>
+              {margen!==null&&<div style={{fontSize:10,color:margen>=15?C.g:C.a,marginTop:2}}>M: {f1(margen)}%</div>}
+            </div>);
+          })}
+        </div>
+        <div style={{fontSize:10,color:C.t3,marginTop:6}}>Precio 1: mayorista básico · Precio 2: intermedio · Precio 3: volumen alto</div>
+      </div>)}
     </div>
   </Modal>);
 }
@@ -858,12 +953,12 @@ function Produccion({st,dispatch}){
   const[aiLoading,setAiLoading]=useState(false);
 
   const selF=st.formulas.find(f=>f.id===form.formula_id);
-  const multi=Math.max(0.5,Number(form.multiplier)||1);
+  const multi=Math.max(0.01,Number(form.multiplier)||1);
   const expectedYield=selF?Math.round(selF.yield_qty*multi):0;
   const actualYield=Number(form.actual_yield)||0;
   const mermaQty=Math.max(0,expectedYield-actualYield);
   const mermaPct=expectedYield>0?mermaQty/expectedYield*100:0;
-  const calcIngs=selF?selF.ingredients.map(ing=>{const p=st.products.find(x=>x.id===ing.product_id);const needed=ing.qty*multi;return{...ing,p,needed,ok:(p?.stock||0)>=needed};}):[];
+  const calcIngs=selF?selF.ingredients.map(ing=>{const p=st.products.find(x=>x.id===ing.product_id);const needed=ing.qty*multi;return{...ing,p,needed,name:p?.name||ing.name||'(sin nombre)',unit:p?.unit||ing.unit||'',ok:(p?.stock||0)>=needed};}):[];
   const totalCost=calcIngs.reduce((a,ing)=>a+ing.needed*(ing.p?.cost||0),0);
   const costPerUnit=actualYield>0?totalCost/actualYield:0;
   const allOk=calcIngs.every(i=>i.ok);
@@ -936,7 +1031,14 @@ Proporciona: 1) Recomendación de qué producir y en qué cantidad 2) Razón bas
                 {st.formulas.filter(f=>f.active).map(f=><option key={f.id} value={f.id}>{f.name} · Rend: {f.yield_qty} {f.yield_unit}</option>)}
               </select>
             </div>
-            <div><label style={lbl}>Multiplicador</label><input type="number" min="0.5" step="0.5" style={inp} value={form.multiplier} onChange={e=>setForm(x=>({...x,multiplier:e.target.value}))}/></div>
+            <div>
+              <label style={lbl}>Multiplicador <span style={{fontSize:10,color:C.t3,fontWeight:400}}>(mín 0.01)</span></label>
+              <input type="number" min="0.01" step="0.01" style={inp} value={form.multiplier} onChange={e=>setForm(x=>({...x,multiplier:e.target.value}))} placeholder="Ej: 1, 0.5, 0.1"/>
+              {selF&&multi>0&&(()=>{
+                const mainIng=calcIngs[0];
+                return mainIng?<div style={{fontSize:11,color:C.t3,marginTop:4}}>≈ {fN(mainIng.needed)} {mainIng.unit} de {mainIng.name}</div>:null;
+              })()}
+            </div>
             <div><label style={lbl}>Fecha</label><input type="date" style={inp} value={form.date} onChange={e=>setForm(x=>({...x,date:e.target.value}))}/></div>
           </div>
         </div>
@@ -1032,7 +1134,13 @@ function Ventas({st,dispatch}){
   const[payments,setPayments]=useState([{key:uid(),method_id:'pos',amount:''}]);
   const[client,setClient]=useState('');
   const[clientId,setClientId]=useState('');
-  const[clientType,setClientType]=useState('regular'); // 'regular'|'employee'
+  const[clientType,setClientType]=useState('regular'); // 'regular'|'employee'|'autoconsumo'|'wholesale'
+  const[autocReason,setAutocReason]=useState('regalo'); // regalo|dañado|degustacion|consumo|merma|otro
+  const[autocNotes,setAutocNotes]=useState('');
+  const[wholesaleLevel,setWholesaleLevel]=useState(1); // 1|2|3
+  const[creditMode,setCreditMode]=useState(false);
+  const[creditDueDate,setCreditDueDate]=useState(()=>{const d=new Date();d.setDate(d.getDate()+15);return d.toISOString().split('T')[0];});
+  const[creditNotes,setCreditNotes]=useState('');
   const[employeeId,setEmployeeId]=useState('');
   const[deductSalary,setDeductSalary]=useState(false);
   const[saleDate,setSaleDate]=useState(todayISO());
@@ -1058,69 +1166,144 @@ function Ventas({st,dispatch}){
   const overpaid=totalPaid>totalUSD+0.001;
   const fullyPaid=totalPaid>=totalUSD-0.001&&totalUSD>0;
   const isDeductMode=clientType==='employee'&&deductSalary&&employeeId;
-  const canConfirm=cart.length>0&&(isDeductMode||fullyPaid);
+  const isAutocMode=clientType==='autoconsumo';
+  const isCreditMode=creditMode&&clientId&&(clientType==='regular'||clientType==='wholesale');
+  // En crédito puede quedar saldo pendiente (todo o parte). Si totalPaid>=totalUSD, no es crédito real
+  const canConfirm=cart.length>0&&(
+    isDeductMode||isAutocMode||isCreditMode||fullyPaid
+  )&&(
+    (clientType==='regular')||
+    (clientType==='wholesale'&&!!clientId)||
+    (clientType==='employee'&&!!employeeId)||
+    (clientType==='autoconsumo')
+  );
 
   function addPaymentLine(){setPayments(prev=>[...prev,{key:uid(),method_id:pms.find(pm=>!prev.some(p=>p.method_id===pm.id))?.id||pms[0]?.id,amount:''}]);}
   function removePaymentLine(key){if(payments.length>1)setPayments(prev=>prev.filter(p=>p.key!==key));}
   function setPaymentField(key,field,val){setPayments(prev=>prev.map(p=>p.key===key?{...p,[field]:val}:p));}
 
-  function addToCart(p){setCart(prev=>{const ex=prev.find(i=>i.pid===p.id);return ex?prev.map(i=>i.pid===p.id?{...i,qty:i.qty+1}:i):[...prev,{pid:p.id,product_id:p.id,name:p.name,price:p.price||0,qty:1,category:p.category}];});}
-  function setQty(pid,qty){if(qty<=0)setCart(prev=>prev.filter(i=>i.pid!==pid));else setCart(prev=>prev.map(i=>i.pid===pid?{...i,qty}:i));}
+  function addToCart(p){
+    // Bloqueo por stock (solo autoconsumo puede seguir; se maneja en confirmSale)
+    const stock=Number(p.stock)||0;
+    if(clientType!=='autoconsumo'&&stock<=0){
+      showToast(`⚠ "${p.name}" sin stock`);
+      return;
+    }
+    setCart(prev=>{
+      const ex=prev.find(i=>i.pid===p.id);
+      if(ex){
+        const nextQty=ex.qty+1;
+        if(clientType!=='autoconsumo'&&nextQty>stock){
+          showToast(`Solo quedan ${stock} unidades de "${p.name}"`);
+          return prev;
+        }
+        return prev.map(i=>i.pid===p.id?{...i,qty:nextQty}:i);
+      }
+      // Precio según nivel para mayorista
+      const priceToUse=clientType==='wholesale'?(p['price_w'+wholesaleLevel]||p.price||0):(p.price||0);
+      return [...prev,{pid:p.id,product_id:p.id,name:p.name,price:priceToUse,qty:1,category:p.category,max_stock:stock}];
+    });
+  }
+  function setQty(pid,qty){
+    if(qty<=0){setCart(prev=>prev.filter(i=>i.pid!==pid));return;}
+    setCart(prev=>prev.map(i=>{
+      if(i.pid!==pid)return i;
+      const stock=st.products.find(x=>x.id===pid)?.stock||0;
+      if(clientType!=='autoconsumo'&&qty>stock){
+        showToast(`Solo quedan ${stock} unidades`);
+        return {...i,qty:stock};
+      }
+      return {...i,qty};
+    }));
+  }
   function setPrice(pid,price){setCart(prev=>prev.map(i=>i.pid===pid?{...i,price:Number(price)}:i));}
 
   function confirmSale(){
     if(!cart.length)return;
-    // Employee deduction mode: skip payment validation
-    if(clientType==='employee'&&deductSalary){
+    const items=cart.map(i=>({product_id:i.product_id,qty:i.qty,price_unit:i.price,total_usd:i.price*i.qty,name:i.name}));
+    const itemsDesc=cart.map(i=>`${i.qty}x ${i.name}`).join(', ');
+    const saleId=uid();
+
+    // ── AUTOCONSUMO ── Descuenta stock sin cobrar
+    if(isAutocMode){
+      const reasonLabels={regalo:'Regalo/Cortesía',dañado:'Producto dañado',degustacion:'Degustación',consumo:'Consumo interno',merma:'Merma',otro:'Otro'};
+      dispatch({type:'ADD_SALE',p:{
+        id:saleId,date:saleDate,
+        client:`Autoconsumo: ${reasonLabels[autocReason]||autocReason}`,client_id:null,
+        payment_method:'autoconsumo',payment_method_name:`Autoconsumo — ${reasonLabels[autocReason]}`,
+        payments:[{method_id:'autoconsumo',method_name:'Autoconsumo',amount_usd:totalUSD,amount_native:totalUSD,currency:'USD',rate_used:vesRate,color:C.o}],
+        items,total_usd:totalUSD,change_bs:0,change_usd_equiv:0,rate_used:vesRate,
+        sale_type:'autoconsumo',autoc_reason:autocReason,autoc_notes:autocNotes,
+      }});
+      showToast(`Autoconsumo registrado: ${reasonLabels[autocReason]} — $${fN(totalUSD)}`);
+    }
+    // ── EMPLEADO CON DESCUENTO DE NÓMINA ──
+    else if(isDeductMode){
       if(!employeeId){showToast('Selecciona un empleado');return;}
       const emp=st.employees.find(e=>e.id===employeeId);
-      const saleId=uid();
       dispatch({type:'ADD_SALE',p:{
         id:saleId,date:saleDate,
         client:emp?.name||'Empleado',client_id:null,
         payment_method:'employee_deduct',payment_method_name:'Descuento Nómina',
-        payments:[{method_id:'employee_deduct',method_name:'Descuento Nómina',amount_usd:totalUSD}],
-        items:cart.map(i=>({product_id:i.product_id,qty:i.qty,price_unit:i.price,total_usd:i.price*i.qty})),
-        total_usd:totalUSD,change_usd:0,
+        payments:[{method_id:'employee_deduct',method_name:'Descuento Nómina',amount_usd:totalUSD,amount_native:totalUSD,currency:'USD',rate_used:vesRate}],
+        items,total_usd:totalUSD,change_bs:0,change_usd_equiv:0,rate_used:vesRate,
+        sale_type:'employee_deduct',
       }});
       dispatch({type:'EMPLOYEE_DEDUCTION',employee_id:employeeId,deduction:{
-        id:uid(),sale_id:saleId,date:saleDate,
-        amount_usd:totalUSD,
-        items_desc:cart.map(i=>`${i.qty}x ${i.name}`).join(', '),
+        id:uid(),sale_id:saleId,date:saleDate,amount_usd:totalUSD,items_desc:itemsDesc,
       }});
       showToast(`Descuento de $${fN(totalUSD)} registrado para ${emp?.name}`);
-    } else {
+    }
+    // ── CRÉDITO puro o crédito con abono parcial ──
+    else if(isCreditMode&&totalPaid<totalUSD){
+      const selClient=st.clients.find(c=>c.id===clientId);
+      const paymentLines=payments.filter(p=>Number(p.amount||0)>0).map(p=>{
+        const pm=pms.find(x=>x.id===p.method_id);
+        const usd=isUSDMethod(p.method_id)?Number(p.amount||0):Number(p.amount||0)/vesRate;
+        return{method_id:p.method_id,method_name:pm?.name||p.method_id,amount_usd:usd,amount_native:Number(p.amount||0),currency:isUSDMethod(p.method_id)?'USD':'VES',rate_used:vesRate,color:pm?.color||C.t3};
+      });
+      const balance=totalUSD-totalPaid;
+      dispatch({type:'ADD_SALE',p:{
+        id:saleId,date:saleDate,
+        client:selClient?.name||'Cliente',client_id:clientId,
+        payment_method:'credito',payment_method_name:'Crédito',
+        payments:paymentLines,
+        items,total_usd:totalUSD,change_bs:0,change_usd_equiv:0,rate_used:vesRate,
+        sale_type:clientType==='wholesale'?'wholesale_credit':'credit',
+        wholesale_level:clientType==='wholesale'?wholesaleLevel:null,
+        credit:{amount_owed:balance,paid_initial:totalPaid,due_date:creditDueDate,notes:creditNotes,payments:[]},
+      }});
+      showToast(`Venta a crédito: ${selClient?.name} debe $${fN(balance)} (vence ${creditDueDate})`);
+    }
+    // ── VENTA NORMAL (contado, mayorista contado, o venta con crédito pagado completo) ──
+    else {
       if(!fullyPaid)return;
       const selClient=clientId?st.clients.find(c=>c.id===clientId):null;
       const paymentLines=payments.filter(p=>Number(p.amount||0)>0).map(p=>{
         const pm=pms.find(x=>x.id===p.method_id);
         const usd=isUSDMethod(p.method_id)?Number(p.amount||0):Number(p.amount||0)/vesRate;
-        return{method_id:p.method_id,method_name:pm?.name||p.method_id,
-          amount_usd:usd,
-          amount_native:Number(p.amount||0),
-          currency:isUSDMethod(p.method_id)?'USD':'VES',
-          rate_used:vesRate,
-          color:pm?.color||C.t3};
+        return{method_id:p.method_id,method_name:pm?.name||p.method_id,amount_usd:usd,amount_native:Number(p.amount||0),currency:isUSDMethod(p.method_id)?'USD':'VES',rate_used:vesRate,color:pm?.color||C.t3};
       });
       const isMixed=paymentLines.length>1;
       const primaryPM=paymentLines[0]||{method_id:'pos',method_name:'POS'};
       const changeUSDEquiv=Math.max(0,totalPaid-totalUSD);
       dispatch({type:'ADD_SALE',p:{
-        id:uid(),date:saleDate,
+        id:saleId,date:saleDate,
         client:selClient?.name||client||'Mostrador',client_id:clientId||null,
         payment_method:isMixed?'mixto':primaryPM.method_id,
         payment_method_name:isMixed?`Mixto (${paymentLines.length} métodos)`:primaryPM.method_name,
         payments:paymentLines,
-        items:cart.map(i=>({product_id:i.product_id,qty:i.qty,price_unit:i.price,total_usd:i.price*i.qty})),
-        total_usd:totalUSD,
-        // Vuelto SIEMPRE en bolívares: los USD son billetes físicos completos
-        change_bs:changeUSDEquiv*vesRate,
-        change_usd_equiv:changeUSDEquiv,
-        rate_used:vesRate,
+        items,total_usd:totalUSD,
+        change_bs:changeUSDEquiv*vesRate,change_usd_equiv:changeUSDEquiv,rate_used:vesRate,
+        sale_type:clientType==='wholesale'?'wholesale':'retail',
+        wholesale_level:clientType==='wholesale'?wholesaleLevel:null,
       }});
       showToast(`Venta registrada. $${fN(totalUSD)}${changeUSDEquiv>0?` · Vuelto en Bs: Bs.${fN(changeUSDEquiv*vesRate)}`:''}`);
     }
+
+    // Limpiar formulario
     setCart([]);setClient('');setClientId('');setEmployeeId('');setDeductSalary(false);
+    setAutocNotes('');setCreditMode(false);setCreditNotes('');
     setPayments([{key:uid(),method_id:'pos',amount:''}]);
   }
 
@@ -1142,10 +1325,30 @@ function Ventas({st,dispatch}){
         <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))',gap:10}}>
           {filtered.map(p=>{
             const inCart=cart.find(i=>i.pid===p.id);
-            return(<button key={p.id} onClick={()=>addToCart(p)} style={{...card({padding:'14px 12px'}),border:`2px solid ${inCart?C.pr:C.bd}`,cursor:'pointer',textAlign:'left',background:inCart?C.prL:'#fff'}}>
-              <div style={{fontWeight:700,fontSize:13,marginBottom:4}}>{p.name}</div>
-              <div style={{fontWeight:800,fontSize:18,color:C.pr}}>${f2(p.price||0)}</div>
-              <div style={{fontSize:11,color:C.t3,marginTop:2}}>{Object.values(cur).find(c=>c.code==='VES')?.symbol}{fN((p.price||0)*Object.values(cur).find(c=>c.code==='VES')?.rate)}</div>
+            const stock=Number(p.stock)||0;
+            const inCartQty=inCart?.qty||0;
+            const available=Math.max(0,stock-inCartQty);
+            const isEmpty=stock<=0;
+            const isLow=!isEmpty&&stock<=(p.min_stock||0);
+            const isAutoc=clientType==='autoconsumo';
+            const disabled=isEmpty&&!isAutoc;
+            // Precio a mostrar (mayorista si aplica)
+            const showPrice=clientType==='wholesale'?(p['price_w'+wholesaleLevel]||p.price||0):(p.price||0);
+            const stockColor=isEmpty?C.r:isLow?C.a:C.g;
+            const stockText=isEmpty?'Sin stock':`${fN(available)} disp.`;
+            return(<button key={p.id} onClick={()=>addToCart(p)} disabled={disabled}
+              style={{...card({padding:'14px 12px'}),border:`2px solid ${inCart?C.pr:isEmpty?C.rT:C.bd}`,cursor:disabled?'not-allowed':'pointer',textAlign:'left',
+                background:inCart?C.prL:isEmpty?'#FAFAFA':'#fff',
+                opacity:disabled?0.5:1,position:'relative'}}>
+              {/* Badge de stock (esquina superior derecha) */}
+              <div style={{position:'absolute',top:6,right:6,background:stockColor+'22',color:stockColor,border:`1px solid ${stockColor}55`,borderRadius:6,padding:'2px 7px',fontSize:10,fontWeight:800,letterSpacing:'0.02em'}}>
+                {isLow&&!isEmpty&&'⚠ '}{stockText}
+              </div>
+              <div style={{fontWeight:700,fontSize:13,marginBottom:4,paddingRight:56}}>{p.name}</div>
+              <div style={{fontWeight:800,fontSize:18,color:C.pr}}>${f2(showPrice)}
+                {clientType==='wholesale'&&<span style={{fontSize:10,color:C.p,marginLeft:5,fontWeight:700}}>M{wholesaleLevel}</span>}
+              </div>
+              <div style={{fontSize:11,color:C.t3,marginTop:2}}>{Object.values(cur).find(c=>c.code==='VES')?.symbol}{fN(showPrice*Object.values(cur).find(c=>c.code==='VES')?.rate)}</div>
               <div style={{marginTop:6,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
                 <Badge txt={p.category} color={C.t3}/>
                 {inCart&&<Badge txt={`×${inCart.qty}`} color={C.pr}/>}
@@ -1168,37 +1371,115 @@ function Ventas({st,dispatch}){
             <div style={{display:'flex',gap:8,marginBottom:8}}>
               <div style={{flex:1}}><label style={lbl}>Fecha</label><input type="date" style={inp} value={saleDate} onChange={e=>setSaleDate(e.target.value)}/></div>
             </div>
-            <label style={lbl}>Tipo de Cliente</label>
-            <div style={{display:'flex',gap:4,marginBottom:7}}>
-              {[['regular','👤 Cliente'],['employee','👷 Empleado']].map(([v,l])=>(<button key={v}
-                style={{padding:'5px 14px',background:clientType===v?C.pr:'#fff',color:clientType===v?'#fff':C.t2,
-                  border:`1.5px solid ${clientType===v?C.pr:C.bd}`,borderRadius:7,cursor:'pointer',fontSize:11,fontWeight:600}}
-                onClick={()=>{setClientType(v);setClientId('');setEmployeeId('');setDeductSalary(false);setClient('');}}>
+            <label style={lbl}>Tipo de Operación</label>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:4,marginBottom:8}}>
+              {[
+                ['regular','👤 Cliente',C.pr],
+                ['wholesale','🏢 Mayorista',C.p],
+                ['employee','👷 Empleado',C.b],
+                ['autoconsumo','🍞 Autoconsumo',C.o],
+              ].map(([v,l,color])=>(<button key={v}
+                style={{padding:'7px 10px',background:clientType===v?color:'#fff',color:clientType===v?'#fff':C.t2,
+                  border:`1.5px solid ${clientType===v?color:C.bd}`,borderRadius:7,cursor:'pointer',fontSize:11,fontWeight:700}}
+                onClick={()=>{
+                  setClientType(v);setClientId('');setEmployeeId('');setDeductSalary(false);setClient('');
+                  setCreditMode(false);
+                  // Al cambiar tipo, recalcular precios del carrito
+                  setCart(prev=>prev.map(it=>{
+                    const p=st.products.find(x=>x.id===it.pid);if(!p)return it;
+                    const newPrice=v==='wholesale'?(p['price_w'+wholesaleLevel]||p.price||0):(p.price||0);
+                    return {...it,price:newPrice};
+                  }));
+                }}>
                 {l}
               </button>))}
             </div>
-            {clientType==='regular'
-              ?<>
-                {st.clients&&st.clients.length>0
-                  ?<select style={sel} value={clientId} onChange={e=>{setClientId(e.target.value);setClient(st.clients.find(c=>c.id===e.target.value)?.name||'');}}>
-                      <option value="">Mostrador / Manual</option>
-                      {st.clients.filter(c=>c.active!==false).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
-                    </select>
-                  :<input style={inp} value={client} onChange={e=>setClient(e.target.value)} placeholder="Mostrador"/>}
-                {!clientId&&st.clients?.length>0&&<input style={{...inp,marginTop:6}} value={client} onChange={e=>setClient(e.target.value)} placeholder="O nombre manual..."/>}
-              </>
-              :<>
-                <select style={sel} value={employeeId} onChange={e=>setEmployeeId(e.target.value)}>
-                  <option value="">Seleccionar empleado...</option>
-                  {(st.employees||[]).filter(e=>e.status==='activo'||e.status==='active').map(e=>(<option key={e.id} value={e.id}>{e.name} — {e.position||'Sin cargo'}</option>))}
-                </select>
-                {employeeId&&(<label style={{display:'flex',alignItems:'center',gap:8,marginTop:7,cursor:'pointer',
-                    padding:'8px 12px',background:deductSalary?C.oL:'#fff',border:`1.5px solid ${deductSalary?C.o:C.bd}`,
-                    borderRadius:8,fontSize:12,fontWeight:600,color:deductSalary?C.o:C.t2}}>
-                  <input type="checkbox" checked={deductSalary} onChange={e=>setDeductSalary(e.target.checked)} style={{width:14,height:14}}/>
-                  💼 Descontar del sueldo (sin cobro en caja)
-                </label>)}
-              </>}
+
+            {/* ── CLIENTE regular ── */}
+            {clientType==='regular'&&(<>
+              {st.clients&&st.clients.length>0
+                ?<select style={sel} value={clientId} onChange={e=>{setClientId(e.target.value);setClient(st.clients.find(c=>c.id===e.target.value)?.name||'');}}>
+                    <option value="">Mostrador / Manual</option>
+                    {st.clients.filter(c=>c.active!==false&&c.type!=='mayorista').map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                :<input style={inp} value={client} onChange={e=>setClient(e.target.value)} placeholder="Mostrador"/>}
+              {!clientId&&st.clients?.length>0&&<input style={{...inp,marginTop:6}} value={client} onChange={e=>setClient(e.target.value)} placeholder="O nombre manual..."/>}
+            </>)}
+
+            {/* ── MAYORISTA ── */}
+            {clientType==='wholesale'&&(<>
+              <select style={sel} value={clientId} onChange={e=>{setClientId(e.target.value);setClient(st.clients.find(c=>c.id===e.target.value)?.name||'');}}>
+                <option value="">Seleccionar mayorista...</option>
+                {(st.clients||[]).filter(c=>c.active!==false&&c.type==='mayorista').map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              {(!st.clients||st.clients.filter(c=>c.type==='mayorista').length===0)&&<div style={{fontSize:11,color:C.a,marginTop:5,padding:'6px 8px',background:C.aL,borderRadius:6}}>⚠ No hay mayoristas. Créalos en la sección Clientes con tipo "Mayorista".</div>}
+              <div style={{marginTop:8}}>
+                <label style={{...lbl,fontSize:11}}>Nivel de Precio</label>
+                <div style={{display:'flex',gap:4}}>
+                  {[1,2,3].map(lvl=>(<button key={lvl}
+                    style={{flex:1,padding:'6px',background:wholesaleLevel===lvl?C.p:'#fff',color:wholesaleLevel===lvl?'#fff':C.t2,border:`1.5px solid ${wholesaleLevel===lvl?C.p:C.bd}`,borderRadius:6,cursor:'pointer',fontSize:11,fontWeight:700}}
+                    onClick={()=>{
+                      setWholesaleLevel(lvl);
+                      setCart(prev=>prev.map(it=>{
+                        const p=st.products.find(x=>x.id===it.pid);if(!p)return it;
+                        return {...it,price:p['price_w'+lvl]||p.price||0};
+                      }));
+                    }}>
+                    Precio {lvl}
+                  </button>))}
+                </div>
+              </div>
+            </>)}
+
+            {/* ── EMPLEADO ── */}
+            {clientType==='employee'&&(<>
+              <select style={sel} value={employeeId} onChange={e=>setEmployeeId(e.target.value)}>
+                <option value="">Seleccionar empleado...</option>
+                {(st.employees||[]).filter(e=>e.status==='activo'||e.status==='active').map(e=>(<option key={e.id} value={e.id}>{e.name} — {e.position||'Sin cargo'}</option>))}
+              </select>
+              {employeeId&&(<label style={{display:'flex',alignItems:'center',gap:8,marginTop:7,cursor:'pointer',
+                  padding:'8px 12px',background:deductSalary?C.oL:'#fff',border:`1.5px solid ${deductSalary?C.o:C.bd}`,
+                  borderRadius:8,fontSize:12,fontWeight:600,color:deductSalary?C.o:C.t2}}>
+                <input type="checkbox" checked={deductSalary} onChange={e=>setDeductSalary(e.target.checked)} style={{width:14,height:14}}/>
+                💼 Descontar del sueldo (sin cobro en caja)
+              </label>)}
+            </>)}
+
+            {/* ── AUTOCONSUMO ── */}
+            {clientType==='autoconsumo'&&(<div style={{background:C.oL,border:`1.5px solid ${C.o}55`,borderRadius:8,padding:'10px 12px'}}>
+              <label style={{...lbl,fontSize:11,color:C.o,marginBottom:4}}>Motivo</label>
+              <select style={sel} value={autocReason} onChange={e=>setAutocReason(e.target.value)}>
+                <option value="regalo">🎁 Regalo / Cortesía</option>
+                <option value="dañado">❌ Producto dañado</option>
+                <option value="degustacion">👅 Degustación</option>
+                <option value="consumo">🍽 Consumo interno</option>
+                <option value="merma">📉 Merma</option>
+                <option value="otro">📝 Otro</option>
+              </select>
+              <input style={{...inp,marginTop:6,fontSize:12}} value={autocNotes} onChange={e=>setAutocNotes(e.target.value)} placeholder="Observaciones (opcional)"/>
+              <div style={{fontSize:11,color:C.o,marginTop:6,fontWeight:600}}>ℹ Descuenta del inventario sin cobrar</div>
+            </div>)}
+
+            {/* ── CRÉDITO — disponible para Cliente y Mayorista con cliente identificado ── */}
+            {(clientType==='regular'||clientType==='wholesale')&&clientId&&(<label style={{display:'flex',alignItems:'center',gap:8,marginTop:8,cursor:'pointer',
+                padding:'8px 12px',background:creditMode?C.aL:'#fff',border:`1.5px solid ${creditMode?C.a:C.bd}`,
+                borderRadius:8,fontSize:12,fontWeight:600,color:creditMode?C.a:C.t2}}>
+              <input type="checkbox" checked={creditMode} onChange={e=>setCreditMode(e.target.checked)} style={{width:14,height:14}}/>
+              📝 Venta a crédito (cobrar después)
+            </label>)}
+            {creditMode&&clientId&&(<div style={{marginTop:6,padding:'8px 12px',background:C.aL,border:`1px solid ${C.a}44`,borderRadius:8}}>
+              <label style={{...lbl,fontSize:11,marginBottom:3}}>Vencimiento</label>
+              <input type="date" style={{...inp,fontSize:12,marginBottom:6}} value={creditDueDate} onChange={e=>setCreditDueDate(e.target.value)}/>
+              <input style={{...inp,fontSize:12}} value={creditNotes} onChange={e=>setCreditNotes(e.target.value)} placeholder="Notas (opcional)"/>
+              {(()=>{
+                const cli=st.clients.find(c=>c.id===clientId);
+                const currentDebt=cli?.credit_balance||0;
+                const limit=cli?.credit_limit||0;
+                if(limit>0&&currentDebt+totalUSD>limit)return <div style={{fontSize:11,color:C.r,marginTop:5,fontWeight:700}}>⚠ Excede límite de crédito ($ {fN(limit)}). Deuda actual: ${fN(currentDebt)}</div>;
+                if(currentDebt>0)return <div style={{fontSize:11,color:C.t3,marginTop:5}}>Deuda actual del cliente: ${fN(currentDebt)}</div>;
+                return null;
+              })()}
+            </div>)}
           </div>
 
           {cart.length===0?<div style={{textAlign:'center',padding:'24px 0',color:C.t3,fontSize:13}}>Selecciona productos del catálogo</div>
@@ -1246,8 +1527,15 @@ function Ventas({st,dispatch}){
               </div>))}
             </div>
 
-            {/* ── PAGOS MIXTOS (ocultos en modo descuento nómina) ── */}
-            {isDeductMode
+            {/* ── PAGOS MIXTOS (ocultos en autoconsumo y descuento nómina) ── */}
+            {isAutocMode
+            ?<div style={{marginBottom:10,padding:'12px 14px',background:C.oL,border:`1.5px solid ${C.o}66`,borderRadius:10}}>
+              <div style={{fontSize:12,fontWeight:700,color:C.o,marginBottom:4}}>🍞 Autoconsumo</div>
+              <div style={{fontSize:12,color:C.t2}}>
+                Descuenta del inventario sin cobrar. Valor estimado <b>${fN(totalUSD)}</b>. Se registra como <b>{{regalo:'Regalo/Cortesía',dañado:'Producto dañado',degustacion:'Degustación',consumo:'Consumo interno',merma:'Merma',otro:'Otro'}[autocReason]}</b>.
+              </div>
+            </div>
+            :isDeductMode
             ?<div style={{marginBottom:10,padding:'12px 14px',background:C.oL,border:`1.5px solid ${C.o}66`,borderRadius:10}}>
               <div style={{fontSize:12,fontWeight:700,color:C.o,marginBottom:4}}>💼 Descuento de Nómina</div>
               <div style={{fontSize:12,color:C.t2}}>
@@ -1256,9 +1544,12 @@ function Ventas({st,dispatch}){
             </div>
             :<div style={{marginBottom:10}}>
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
-                <label style={{...lbl,marginBottom:0,fontSize:14,fontWeight:700}}>Forma(s) de Pago</label>
+                <label style={{...lbl,marginBottom:0,fontSize:14,fontWeight:700}}>
+                  {isCreditMode?'Abono inicial (opcional)':'Forma(s) de Pago'}
+                </label>
                 <button style={{...bSm(C.prL,C.pr,C.prT),fontSize:13}} onClick={addPaymentLine}>+ Agregar método</button>
               </div>
+              {isCreditMode&&<div style={{fontSize:11,color:C.a,marginBottom:6,fontWeight:600}}>📝 Deja vacío para venta 100% a crédito, o registra un abono parcial ahora</div>}
 
               {payments.map((pay)=>{
                 const pm=pms.find(x=>x.id===pay.method_id)||pms[0];
@@ -1366,10 +1657,17 @@ function Ventas({st,dispatch}){
           <button onClick={confirmSale} disabled={!canConfirm}
             style={{...bPr,width:'100%',justifyContent:'center',padding:'13px',fontSize:15,fontWeight:800,
               opacity:!canConfirm?0.5:1,
-              background:canConfirm?`linear-gradient(135deg,${C.g},#15803d)`:C.pr}}>
+              background:canConfirm?`linear-gradient(135deg,${
+                isAutocMode?C.o:isDeductMode?C.o:isCreditMode&&remaining>0.009?C.a:C.g
+              },${isAutocMode||isDeductMode?'#c2410c':isCreditMode&&remaining>0.009?'#b45309':'#15803d'})`:C.pr}}>
             {!cart.length?'✓ Registrar Venta'
+              :isAutocMode?`🍞 Registrar autoconsumo — $${fN(totalUSD)}`
               :isDeductMode?`💼 Descontar $${fN(totalUSD)} del sueldo`
+              :isCreditMode&&remaining>0.009?`📝 Vender a crédito — Debe $${fN(remaining)}`
+              :isCreditMode&&fullyPaid?`✓ Registrar venta (pagada completa)`
+              :clientType==='wholesale'&&!clientId?`⚠ Selecciona mayorista`
               :!fullyPaid?`⚠ Faltan $${fN(remaining)} (Bs.${fN(remainingBs)})`
+              :clientType==='wholesale'?`🏢 Registrar venta mayorista — $${fN(totalUSD)}`
               :'✓ Registrar Venta'}
           </button>
         </div>
@@ -1559,11 +1857,19 @@ function Inventario({st,dispatch}){
   const[adjustModal,setAdjustModal]=useState(null);
   const[adj,setAdj]=useState({qty:'',notes:''});
   const[filterType,setFilterType]=useState('all');
+  const[search,setSearch]=useState('');
   const[ToastEl,showToast]=useToast();
   const movements=st.inv_movements||[];
   const{paged,page,setPage,totalPages}=usePagination(movements,20);
 
-  const prods=st.products.filter(p=>filterType==='all'||p.type===filterType).sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+  const prods=st.products.filter(p=>{
+    if(filterType!=='all'&&p.type!==filterType)return false;
+    if(!search)return true;
+    const q=search.toLowerCase();
+    return (String(p.name||'').toLowerCase().includes(q)
+      ||String(p.code||'').toLowerCase().includes(q)
+      ||String(p.category||'').toLowerCase().includes(q));
+  }).sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
   const lowStock=st.products.filter(p=>p.active&&p.stock<=p.min_stock&&p.min_stock>0);
   const totalValue=st.products.reduce((a,p)=>a+p.stock*p.cost,0);
 
@@ -1593,10 +1899,16 @@ function Inventario({st,dispatch}){
     </div>
 
     {view==='stock'&&(<>
-      <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}}>
+      <div style={{display:'flex',gap:10,marginBottom:14,flexWrap:'wrap',alignItems:'center'}}>
+        <div style={{position:'relative',flex:'1 1 260px',minWidth:220,maxWidth:420}}>
+          <span style={{position:'absolute',left:11,top:'50%',transform:'translateY(-50%)',fontSize:14,color:C.t3,pointerEvents:'none'}}>🔍</span>
+          <input style={{...inp,paddingLeft:34}} placeholder="Buscar por nombre, código o categoría..." value={search} onChange={e=>setSearch(e.target.value)}/>
+          {search&&<button onClick={()=>setSearch('')} style={{position:'absolute',right:8,top:'50%',transform:'translateY(-50%)',background:'none',border:'none',color:C.t3,cursor:'pointer',fontSize:14,padding:'2px 6px'}}>✕</button>}
+        </div>
         {[{v:'all',l:'Todos'},{v:'materia_prima',l:'Materia Prima'},{v:'terminado',l:'Terminado'},{v:'venta',l:'Venta'}].map(t=>(
           <button key={t.v} onClick={()=>setFilterType(t.v)} style={{padding:'6px 14px',background:filterType===t.v?C.pr:C.card,color:filterType===t.v?'#fff':C.t2,border:`1.5px solid ${filterType===t.v?C.pr:C.bd}`,borderRadius:7,cursor:'pointer',fontSize:12,fontWeight:600}}>{t.l}</button>
         ))}
+        {(search||filterType!=='all')&&<span style={{fontSize:12,color:C.t3,marginLeft:'auto'}}>{prods.length} resultado{prods.length!==1?'s':''}</span>}
       </div>
       <div style={card({padding:0,overflow:'hidden'})}>
         <table style={{width:'100%',borderCollapse:'collapse'}}>
@@ -1652,6 +1964,7 @@ function CuadreCaja({st,dispatch}){
   const USD_DENOMS=[100,50,20,10,5,1];
   const[actualBs,setActualBs]=useState({});    // pos/mobile/cash_ves counting in Bs
   const[notes,setNotes]=useState('');
+  const[detailClose,setDetailClose]=useState(null); // cierre seleccionado para ver detalle
   const[ToastEl,showToast]=useToast();
 
   const vesRate=Object.values(st.currencies).find(c=>c.code==='VES')?.rate||1;
@@ -1664,7 +1977,7 @@ function CuadreCaja({st,dispatch}){
   const shiftNum=dayCloses.length+1;
 
   const daysSales=st.sales.filter(s=>s.date===closeDate&&s.payment_method!=='employee_deduct'&&(s.ts||0)>lastCloseTs);
-  const dayExpenses=(st.expenses||[]).filter(e=>e.date===closeDate&&(e.ts||0)>lastCloseTs);
+  const dayExpenses=getAllExpenses(st,'caja').filter(e=>e.date===closeDate&&(e.ts||0)>lastCloseTs);
   const dayDeductions=(st.employees||[]).flatMap(e=>(e.salary_deductions||[]).filter(d=>d.date===closeDate&&(d.ts||0)>lastCloseTs).map(d=>({...d,emp_name:e.name})));
 
   // Compute how much came in per payment method (in USD)
@@ -1719,6 +2032,7 @@ function CuadreCaja({st,dispatch}){
       expenses_total:totalDayExpenses,deductions_total:totalDeductions,
       change_bs_given:changeBsGiven,
       net_result:netDay,panes,
+      rate_used:vesRate,
       closed_by:st.current_user?.name||'—',
       notes,closed_at:nowISO(),ts:Date.now(),
     }});
@@ -1889,10 +2203,11 @@ function CuadreCaja({st,dispatch}){
           <th style={{...TH,textAlign:'right'}}>Gastos</th>
           <th style={{...TH,textAlign:'right'}}>Neto</th>
           <th style={{...TH,textAlign:'center'}}>Estado</th>
+          <th style={{...TH,textAlign:'center'}}>Detalle</th>
         </tr></thead>
         <tbody>{st.cash_closes.length===0
-          ?<tr><td colSpan={9}><EmptyState icon="💰" title="Sin cierres registrados" sub="Registra el primer cierre de caja"/></td></tr>
-          :st.cash_closes.map(c=>(<tr key={c.id}>
+          ?<tr><td colSpan={10}><EmptyState icon="💰" title="Sin cierres registrados" sub="Registra el primer cierre de caja"/></td></tr>
+          :st.cash_closes.map(c=>(<tr key={c.id} style={{cursor:'pointer'}} onClick={()=>setDetailClose(c)}>
             <td style={{...TD,fontWeight:700}}>{c.date}<div style={{fontSize:10,color:C.t3,fontWeight:400}}>{(c.closed_at||'').split(' ')[1]||''}</div></td>
             <td style={TD}><Badge txt={`Turno ${c.shift||1}`} color={C.p}/></td>
             <td style={TD}><Badge txt={`👤 ${c.closed_by||'—'}`} color={C.b}/></td>
@@ -1906,11 +2221,238 @@ function CuadreCaja({st,dispatch}){
                 ?<Badge txt="✓ Exacto" color={C.g}/>
                 :<Badge txt="Con diff." color={C.a}/>}
             </td>
+            <td style={{...TD,textAlign:'center'}}>
+              <button style={bSm(C.prL,C.pr,C.prT)} onClick={e=>{e.stopPropagation();setDetailClose(c);}}>👁 Ver</button>
+            </td>
           </tr>))}
         </tbody>
       </table>
     </div>)}
+
+    {/* Modal de detalle del cierre */}
+    {detailClose&&<CashCloseDetail close={detailClose} st={st} onClose={()=>setDetailClose(null)}/>}
   </div>);
+}
+
+// ── DETALLE DE CIERRE DE CAJA ─────────────────────────────────────────
+function CashCloseDetail({close:c,st,onClose}){
+  const[pmFilter,setPmFilter]=useState('all');
+  const vesRate=c.rate_used||Object.values(st.currencies||{}).find(cx=>cx.code==='VES')?.rate||1;
+  const USD_DENOMS=[100,50,20,10,5,1];
+
+  // Determinar rango de este turno: desde el cierre anterior hasta este
+  const prevClose=st.cash_closes
+    .filter(x=>x.date===c.date&&(x.ts||0)<(c.ts||0))
+    .sort((a,b)=>(b.ts||0)-(a.ts||0))[0];
+  const fromTs=prevClose?.ts||0;
+  const toTs=c.ts||Date.now();
+
+  const shiftSales=(st.sales||[]).filter(s=>s.date===c.date&&(s.ts||0)>fromTs&&(s.ts||0)<=toTs);
+  const shiftExpenses=getAllExpenses(st,'caja').filter(e=>e.date===c.date&&(e.ts||0)>fromTs&&(e.ts||0)<=toTs);
+  const shiftDeductions=(st.employees||[]).flatMap(e=>(e.salary_deductions||[]).filter(d=>d.date===c.date&&(d.ts||0)>fromTs&&(d.ts||0)<=toTs).map(d=>({...d,emp_name:e.name})));
+
+  // Desglose por método
+  const salesByType={
+    cash_usd:{name:'Efectivo USD',color:C.g,total_usd:0,count:0},
+    pos:{name:'Punto de Venta',color:C.b,total_usd:0,count:0},
+    mobile:{name:'Pago Móvil',color:C.p,total_usd:0,count:0},
+    cash_ves:{name:'Efectivo Bs',color:C.a,total_usd:0,count:0},
+    credito:{name:'Crédito',color:C.a,total_usd:0,count:0},
+    employee_deduct:{name:'Descuento Nómina',color:C.o,total_usd:0,count:0},
+    autoconsumo:{name:'Autoconsumo',color:C.o,total_usd:0,count:0},
+  };
+  shiftSales.forEach(s=>{
+    if(s.payments?.length>0){
+      s.payments.forEach(p=>{if(salesByType[p.method_id])salesByType[p.method_id].total_usd+=p.amount_usd;});
+    } else if(salesByType[s.payment_method]) {
+      salesByType[s.payment_method].total_usd+=s.total_usd;
+    }
+    // Contar la venta por su tipo primario
+    const primary=s.payment_method;
+    if(salesByType[primary])salesByType[primary].count++;
+  });
+
+  const filteredSales=pmFilter==='all'?shiftSales:shiftSales.filter(s=>s.payment_method===pmFilter||s.payments?.some(p=>p.method_id===pmFilter));
+
+  const totalCash=shiftSales.filter(s=>s.sale_type!=='autoconsumo'&&s.sale_type!=='employee_deduct'&&s.sale_type!=='credit'&&s.sale_type!=='wholesale_credit').reduce((a,s)=>a+s.total_usd,0);
+  const totalCredit=shiftSales.filter(s=>s.sale_type==='credit'||s.sale_type==='wholesale_credit').reduce((a,s)=>a+s.total_usd,0);
+  const totalAutoc=shiftSales.filter(s=>s.sale_type==='autoconsumo').reduce((a,s)=>a+s.total_usd,0);
+  const totalGastos=shiftExpenses.reduce((a,e)=>a+e.amount_usd,0);
+
+  function exportDetail(){
+    const rows=filteredSales.map(s=>({
+      Hora:s.ts?new Date(s.ts).toLocaleTimeString('es-VE'):'',
+      Factura:'#'+s.id.slice(-6),
+      Cliente:s.client||'',
+      Tipo:s.sale_type==='autoconsumo'?'Autoconsumo':s.sale_type==='credit'?'Crédito':s.sale_type==='wholesale'?'Mayorista':s.sale_type==='wholesale_credit'?'Mayorista/Crédito':s.sale_type==='employee_deduct'?'Empleado':'Contado',
+      Items:s.items.reduce((a,i)=>a+i.qty,0),
+      PagoPrincipal:s.payment_method_name||s.payment_method,
+      TotalUSD:f2(s.total_usd),
+      TotalBs:f2(s.total_usd*vesRate),
+      Vendió:s.sold_by||''
+    }));
+    exportCSV(rows,`cierre_turno${c.shift||1}_${c.date}.csv`);
+  }
+
+  return(<Modal title={`Detalle del Cierre — ${c.date} · Turno ${c.shift||1}`} onClose={onClose} width={880}
+    footer={<>
+      <button style={bSc} onClick={onClose}>Cerrar</button>
+      <button style={bSm(C.gL,C.g,C.gT)} onClick={exportDetail}>⬇ Descargar CSV</button>
+      <button style={bSm(C.bL,C.b,C.bT)} onClick={()=>window.print()}>🖨 Imprimir</button>
+    </>}>
+    {/* Cabecera */}
+    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:14}}>
+      <div style={{padding:'8px 10px',background:'#F8FAFC',borderRadius:8}}>
+        <div style={{fontSize:10,color:C.t3,textTransform:'uppercase',fontWeight:700}}>Cerró</div>
+        <div style={{fontWeight:700,fontSize:13}}>{c.closed_by||'—'}</div>
+      </div>
+      <div style={{padding:'8px 10px',background:'#F8FAFC',borderRadius:8}}>
+        <div style={{fontSize:10,color:C.t3,textTransform:'uppercase',fontWeight:700}}>Hora cierre</div>
+        <div style={{fontWeight:700,fontSize:13}}>{c.closed_at||'—'}</div>
+      </div>
+      <div style={{padding:'8px 10px',background:'#F8FAFC',borderRadius:8}}>
+        <div style={{fontSize:10,color:C.t3,textTransform:'uppercase',fontWeight:700}}>Tasa usada</div>
+        <div style={{fontWeight:700,fontSize:13}}>Bs.{fN(vesRate)}/$</div>
+      </div>
+      <div style={{padding:'8px 10px',background:'#F8FAFC',borderRadius:8}}>
+        <div style={{fontSize:10,color:C.t3,textTransform:'uppercase',fontWeight:700}}>Panes</div>
+        <div style={{fontWeight:700,fontSize:13}}>{c.panes}</div>
+      </div>
+    </div>
+
+    {/* Totales */}
+    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:14}}>
+      <div style={{padding:10,background:C.gL,border:`1.5px solid ${C.gT}`,borderRadius:8}}>
+        <div style={{fontSize:10,color:C.g,fontWeight:800,textTransform:'uppercase'}}>Ventas Contado</div>
+        <div style={{fontSize:17,fontWeight:900,color:C.g}}>${fN(totalCash)}</div>
+      </div>
+      <div style={{padding:10,background:C.aL,border:`1.5px solid ${C.aT}`,borderRadius:8}}>
+        <div style={{fontSize:10,color:C.a,fontWeight:800,textTransform:'uppercase'}}>A Crédito</div>
+        <div style={{fontSize:17,fontWeight:900,color:C.a}}>${fN(totalCredit)}</div>
+      </div>
+      <div style={{padding:10,background:C.oL,border:`1.5px solid ${C.o}55`,borderRadius:8}}>
+        <div style={{fontSize:10,color:C.o,fontWeight:800,textTransform:'uppercase'}}>Autoconsumo</div>
+        <div style={{fontSize:17,fontWeight:900,color:C.o}}>${fN(totalAutoc)}</div>
+      </div>
+      <div style={{padding:10,background:C.rL,border:`1.5px solid ${C.rT}`,borderRadius:8}}>
+        <div style={{fontSize:10,color:C.r,fontWeight:800,textTransform:'uppercase'}}>Gastos</div>
+        <div style={{fontSize:17,fontWeight:900,color:C.r}}>${fN(totalGastos)}</div>
+      </div>
+    </div>
+
+    {/* Desglose por método */}
+    <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>💳 Desglose por Método</div>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(140px,1fr))',gap:6,marginBottom:16}}>
+      {Object.entries(salesByType).filter(([id,v])=>v.total_usd>0).map(([id,v])=>(<button key={id}
+        onClick={()=>setPmFilter(pmFilter===id?'all':id)}
+        style={{padding:8,textAlign:'left',background:pmFilter===id?v.color+'33':'#fff',border:`1.5px solid ${pmFilter===id?v.color:C.bd}`,borderRadius:8,cursor:'pointer'}}>
+        <div style={{fontSize:10,color:C.t3,textTransform:'uppercase',fontWeight:700,marginBottom:2}}>{v.name}</div>
+        <div style={{fontSize:14,fontWeight:800,color:v.color}}>${fN(v.total_usd)}</div>
+        <div style={{fontSize:10,color:C.t3}}>Bs.{fN(v.total_usd*vesRate)}</div>
+      </button>))}
+    </div>
+    {pmFilter!=='all'&&<div style={{fontSize:11,color:C.pr,marginBottom:8}}>Filtrando por <b>{salesByType[pmFilter]?.name}</b> · <button style={{background:'none',border:'none',color:C.pr,cursor:'pointer',textDecoration:'underline'}} onClick={()=>setPmFilter('all')}>ver todo</button></div>}
+
+    {/* Tabla de ventas */}
+    <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>🧾 Ventas del Turno ({filteredSales.length})</div>
+    <div style={{maxHeight:280,overflowY:'auto',border:`1px solid ${C.bd}`,borderRadius:8,marginBottom:16}}>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+        <thead style={{position:'sticky',top:0,background:'#F8FAFC'}}><tr>
+          <th style={{...TH,padding:'6px 8px'}}>Hora</th>
+          <th style={{...TH,padding:'6px 8px'}}>Cliente</th>
+          <th style={{...TH,padding:'6px 8px'}}>Tipo</th>
+          <th style={{...TH,padding:'6px 8px',textAlign:'center'}}>Items</th>
+          <th style={{...TH,padding:'6px 8px'}}>Método</th>
+          <th style={{...TH,padding:'6px 8px',textAlign:'right'}}>Total</th>
+        </tr></thead>
+        <tbody>
+          {filteredSales.length===0
+            ?<tr><td colSpan={6} style={{padding:20,textAlign:'center',color:C.t3}}>Sin ventas para este filtro</td></tr>
+            :filteredSales.map(s=>(<tr key={s.id}>
+              <td style={{...TD,padding:'6px 8px',fontSize:11,color:C.t3}}>{s.ts?new Date(s.ts).toLocaleTimeString('es-VE',{hour:'2-digit',minute:'2-digit'}):'—'}</td>
+              <td style={{...TD,padding:'6px 8px',fontWeight:600}}>{s.client||'Mostrador'}</td>
+              <td style={{...TD,padding:'6px 8px'}}>
+                {s.sale_type==='autoconsumo'?<Badge txt="🍞 Autoc." color={C.o}/>
+                :s.sale_type==='credit'||s.sale_type==='wholesale_credit'?<Badge txt="📝 Crédito" color={C.a}/>
+                :s.sale_type==='wholesale'?<Badge txt="🏢 Mayor." color={C.p}/>
+                :s.sale_type==='employee_deduct'?<Badge txt="💼 Nómina" color={C.o}/>
+                :<Badge txt="Contado" color={C.g}/>}
+              </td>
+              <td style={{...TD,padding:'6px 8px',textAlign:'center'}}>{s.items.reduce((a,i)=>a+i.qty,0)}</td>
+              <td style={{...TD,padding:'6px 8px',fontSize:11}}>
+                {s.payments?.length>1
+                  ?`Mixto (${s.payments.length})`
+                  :s.payment_method_name||s.payment_method}
+              </td>
+              <td style={{...TD,padding:'6px 8px',textAlign:'right',fontWeight:700,color:C.g}}>${fN(s.total_usd)}</td>
+            </tr>))}
+        </tbody>
+      </table>
+    </div>
+
+    {/* Gastos y descuentos */}
+    {shiftExpenses.length>0&&(<div style={{marginBottom:14}}>
+      <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>💸 Gastos del Turno</div>
+      <div style={{border:`1px solid ${C.bd}`,borderRadius:8,overflow:'hidden'}}>
+        {shiftExpenses.map(e=>(<div key={e.id} style={{display:'flex',justifyContent:'space-between',padding:'6px 10px',borderBottom:`1px solid ${C.bd}`,fontSize:12}}>
+          <span><Badge txt={e.source==='compra'?'🏭':'⚡'} color={C.t3}/> <b>{e.category}</b>: {e.description}</span>
+          <span style={{fontWeight:700,color:C.o}}>${fN(e.amount_usd)}</span>
+        </div>))}
+      </div>
+    </div>)}
+
+    {shiftDeductions.length>0&&(<div style={{marginBottom:14}}>
+      <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>👷 Descuentos de Nómina del Turno</div>
+      <div style={{border:`1px solid ${C.bd}`,borderRadius:8,overflow:'hidden'}}>
+        {shiftDeductions.map(d=>(<div key={d.id} style={{display:'flex',justifyContent:'space-between',padding:'6px 10px',borderBottom:`1px solid ${C.bd}`,fontSize:12}}>
+          <span><b>{d.emp_name}</b>: {d.items_desc}</span>
+          <span style={{fontWeight:700,color:C.p}}>${fN(d.amount_usd)}</span>
+        </div>))}
+      </div>
+    </div>)}
+
+    {/* Conteo físico */}
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+      <div style={{...card({padding:14}),borderLeft:`3px solid ${C.g}`}}>
+        <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>💵 Conteo USD</div>
+        {c.usd_bills&&Object.keys(c.usd_bills).length>0
+          ?USD_DENOMS.filter(d=>Number(c.usd_bills[d])>0).map(d=>(<div key={d} style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'3px 0'}}>
+              <span style={{color:C.t2}}>${d} × {c.usd_bills[d]}</span>
+              <span style={{fontWeight:700,color:C.g}}>${d*Number(c.usd_bills[d])}</span>
+            </div>))
+          :<div style={{fontSize:11,color:C.t3}}>Sin desglose de billetes</div>}
+        <div style={{borderTop:`1px solid ${C.bd}`,marginTop:6,paddingTop:6,display:'flex',justifyContent:'space-between',fontWeight:800}}>
+          <span>Total contado:</span><span style={{color:C.b}}>${fN(c.actual_usd||0)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:12,marginTop:3}}>
+          <span style={{color:C.t2}}>Sistema:</span><span style={{color:C.g}}>${fN(c.total_usd_cash||0)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:13,fontWeight:800,marginTop:5}}>
+          <span>Diferencia:</span>
+          <span style={{color:Math.abs(c.diff_usd||0)<0.01?C.g:(c.diff_usd||0)>0?C.b:C.r}}>{(c.diff_usd||0)>0?'+':''}{fN(c.diff_usd||0)}</span>
+        </div>
+      </div>
+      <div style={{...card({padding:14}),borderLeft:`3px solid ${C.a}`}}>
+        <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>💴 Conteo Bolívares</div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:12,padding:'3px 0'}}>
+          <span style={{color:C.t2}}>Total contado:</span>
+          <span style={{fontWeight:700,color:C.b}}>Bs.{fN(c.actual_bs||0)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:12}}>
+          <span style={{color:C.t2}}>Sistema:</span><span style={{color:C.a}}>Bs.{fN(c.total_bs_sales||0)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:13,fontWeight:800,marginTop:5}}>
+          <span>Diferencia:</span>
+          <span style={{color:Math.abs(c.diff_bs||0)<1?C.g:(c.diff_bs||0)>0?C.b:C.r}}>{(c.diff_bs||0)>0?'+':''}{fN(c.diff_bs||0)}</span>
+        </div>
+      </div>
+    </div>
+
+    {c.notes&&(<div style={{marginTop:14,padding:'10px 14px',background:'#F8FAFC',borderRadius:8,fontSize:12}}>
+      <div style={{fontWeight:700,color:C.t3,textTransform:'uppercase',fontSize:10,marginBottom:3}}>Observaciones</div>
+      {c.notes}
+    </div>)}
+  </Modal>);
 }
 
 // ── REPORTES ──────────────────────────────────────────────────────────
@@ -2121,15 +2663,17 @@ function Clientes({st,dispatch}){
     {filtered.length===0?<EmptyState icon="👥" title="Sin clientes" sub="Agrega el primer cliente"/>
     :<div style={card({padding:0,overflow:'hidden'})}>
       <table style={{width:'100%',borderCollapse:'collapse'}}>
-        <thead><tr><th style={TH}>Nombre</th><th style={TH}>Teléfono</th><th style={TH}>Email</th><th style={TH}>Tipo</th><th style={{...TH,textAlign:'right'}}>Compras</th><th style={TH}>Última Compra</th><th style={TH}>Notas</th><th style={{...TH,textAlign:'center'}}>Estado</th><th style={{...TH,textAlign:'center'}}>Acción</th></tr></thead>
+        <thead><tr><th style={TH}>Nombre</th><th style={TH}>Teléfono</th><th style={TH}>Tipo</th><th style={{...TH,textAlign:'right'}}>Compras</th><th style={{...TH,textAlign:'right'}}>Debe</th><th style={TH}>Última Compra</th><th style={{...TH,textAlign:'center'}}>Estado</th><th style={{...TH,textAlign:'center'}}>Acción</th></tr></thead>
         <tbody>{filtered.map(c=>(<tr key={c.id}>
-          <td style={{...TD,fontWeight:700}}>{c.name}</td>
+          <td style={{...TD,fontWeight:700}}>{c.name}{c.email&&<div style={{fontSize:10,color:C.t3,fontWeight:400}}>{c.email}</div>}</td>
           <td style={TD}>{c.phone||'—'}</td>
-          <td style={{...TD,fontSize:12,color:C.t2}}>{c.email||'—'}</td>
           <td style={TD}><Badge txt={c.type||'regular'} color={c.type==='vip'?C.p:c.type==='mayorista'?C.b:C.t2}/></td>
           <td style={{...TD,textAlign:'right',fontWeight:700,color:C.g}}>${fN(c.total_purchases||0)}</td>
+          <td style={{...TD,textAlign:'right',fontWeight:700,color:(c.credit_balance||0)>0?C.a:C.t3}}>
+            {(c.credit_balance||0)>0?`$${fN(c.credit_balance)}`:'—'}
+            {c.credit_limit>0&&<div style={{fontSize:9,color:C.t3,fontWeight:400}}>lím: ${fN(c.credit_limit)}</div>}
+          </td>
           <td style={{...TD,color:C.t3,fontSize:12}}>{c.last_purchase||'—'}</td>
-          <td style={{...TD,color:C.t3,fontSize:12,maxWidth:140,overflow:'hidden',textOverflow:'ellipsis'}}>{c.notes||'—'}</td>
           <td style={{...TD,textAlign:'center'}}><Badge txt={c.active!==false?'Activo':'Inactivo'} color={c.active!==false?C.g:C.t3}/></td>
           <td style={{...TD,textAlign:'center'}}>
             <div style={{display:'flex',gap:5,justifyContent:'center'}}>
@@ -2148,11 +2692,14 @@ function Clientes({st,dispatch}){
         <div><label style={lbl}>Teléfono</label><input style={inp} value={editing.phone||''} onChange={e=>setEditing(x=>({...x,phone:e.target.value}))} placeholder="0412-1234567"/></div>
         <div><label style={lbl}>Email</label><input type="email" style={inp} value={editing.email||''} onChange={e=>setEditing(x=>({...x,email:e.target.value}))} placeholder="correo@ejemplo.com"/></div>
         <div><label style={lbl}>Tipo de cliente</label><select style={sel} value={editing.type||'regular'} onChange={e=>setEditing(x=>({...x,type:e.target.value}))}>
-          <option value="regular">Regular</option><option value="vip">VIP</option><option value="mayorista">Mayorista</option><option value="ocasional">Ocasional</option>
+          <option value="regular">Regular</option><option value="vip">VIP</option><option value="mayorista">🏢 Mayorista</option><option value="ocasional">Ocasional</option>
         </select></div>
-        <div><label style={lbl}>Estado</label><select style={sel} value={editing.active!==false?'true':'false'} onChange={e=>setEditing(x=>({...x,active:e.target.value==='true'}))}><option value="true">Activo</option><option value="false">Inactivo</option></select></div>
+        <div><label style={lbl}>Límite de crédito (USD)</label><input type="number" step="1" min="0" style={inp} value={editing.credit_limit||''} onChange={e=>setEditing(x=>({...x,credit_limit:Number(e.target.value)||0}))} placeholder="0 = sin límite"/></div>
         <div style={{gridColumn:'1/-1'}}><label style={lbl}>Notas</label><input style={inp} value={editing.notes||''} onChange={e=>setEditing(x=>({...x,notes:e.target.value}))} placeholder="Observaciones, preferencias, horarios..."/></div>
       </div>
+      {(editing.credit_balance||0)>0&&<div style={{marginTop:10,padding:'8px 12px',background:C.aL,border:`1px solid ${C.aT}`,borderRadius:8,fontSize:12,color:C.a,fontWeight:600}}>
+        💳 Deuda actual: ${fN(editing.credit_balance)} — ver en Cuentas por Cobrar
+      </div>}
     </Modal>)}
   </div>);
 }
@@ -2164,12 +2711,23 @@ function Gastos({st,dispatch}){
   const[showForm,setShowForm]=useState(false);
   const[editing,setEditing]=useState(null);
   const[dateFilter,setDateFilter]=useState(thisMonth());
+  const[mode,setMode]=useState('caja'); // 'caja' | 'devengado'
+  const[sourceFilter,setSourceFilter]=useState('all'); // 'all' | 'operativo' | 'compra'
   const[ToastEl,showToast]=useToast();
   const expenses=st.expenses||[];
 
-  const filtered=dateFilter?expenses.filter(e=>e.date.startsWith(dateFilter)):expenses;
-  const{paged,page,setPage,totalPages}=usePagination(filtered,15);
+  // Combinado: gastos operativos + compras (según modo)
+  const combined=getAllExpenses(st,mode);
+  const filtered=combined.filter(e=>{
+    if(dateFilter&&!(e.date||'').startsWith(dateFilter))return false;
+    if(sourceFilter!=='all'&&e.source!==sourceFilter)return false;
+    return true;
+  });
+  const{paged,page,setPage,totalPages}=usePagination(filtered,20);
   const totalFiltered=filtered.reduce((a,e)=>a+e.amount_usd,0);
+  const totalOperativo=filtered.filter(e=>e.source==='operativo').reduce((a,e)=>a+e.amount_usd,0);
+  const totalCompras=filtered.filter(e=>e.source==='compra').reduce((a,e)=>a+e.amount_usd,0);
+  const totalPendiente=filtered.filter(e=>e.source==='compra'&&e.is_credit&&!e.is_paid).reduce((a,e)=>a+e.amount_usd,0);
   const byCategory={};filtered.forEach(e=>{if(!byCategory[e.category])byCategory[e.category]=0;byCategory[e.category]+=e.amount_usd;});
   const ves=Object.values(st.currencies||{}).find(c=>c.code==='VES');
 
@@ -2177,49 +2735,71 @@ function Gastos({st,dispatch}){
   function save(e){const exists=expenses.find(x=>x.id===e.id);dispatch(exists?{type:'UPD_EXPENSE',p:{...e,amount_usd:Number(e.amount_usd)}}:{type:'ADD_EXPENSE',p:{...e,id:uid(),amount_usd:Number(e.amount_usd)}});showToast('Gasto guardado');setShowForm(false);setEditing(null);}
 
   return(<div>{ToastEl}
-    <PageHeader title="Gastos Operativos" sub="Registro y control de gastos del negocio">
+    <PageHeader title="Gastos" sub="Operativos + Compras a proveedores">
       <button style={bPr} onClick={()=>openEdit(null)}>+ Registrar Gasto</button>
     </PageHeader>
 
     <div style={{...card(),padding:'14px 16px',marginBottom:16,display:'flex',gap:10,alignItems:'flex-end',flexWrap:'wrap'}}>
       <div><label style={lbl}>Filtrar por mes</label><input type="month" style={{...inp,width:'auto'}} value={dateFilter} onChange={e=>setDateFilter(e.target.value)}/></div>
       <button style={bSm(C.bd,C.t2,C.bd)} onClick={()=>setDateFilter('')}>Ver todos</button>
-      {dateFilter&&<div style={{fontSize:13,color:C.t3}}>{filtered.length} gastos · <strong style={{color:C.o}}>${fN(totalFiltered)}</strong></div>}
-      <button style={{...bSm(C.gL,C.g,C.gT),marginLeft:'auto'}} onClick={()=>exportCSV(filtered.map(e=>({Fecha:e.date,Categoría:e.category,Descripción:e.description,MontoUSD:f2(e.amount_usd)})),'gastos.csv')}>⬇ CSV</button>
+      <div style={{display:'flex',borderRadius:8,border:`1.5px solid ${C.bd}`,overflow:'hidden'}}>
+        {[['caja','💵 Salida de caja'],['devengado','📊 Gasto devengado']].map(([v,l])=>(<button key={v} onClick={()=>setMode(v)}
+          style={{padding:'6px 12px',background:mode===v?C.o:'#fff',color:mode===v?'#fff':C.t2,border:'none',cursor:'pointer',fontSize:12,fontWeight:600}}>{l}</button>))}
+      </div>
+      <div style={{display:'flex',borderRadius:8,border:`1.5px solid ${C.bd}`,overflow:'hidden'}}>
+        {[['all','Todos'],['operativo','⚡ Operativos'],['compra','🏭 Compras']].map(([v,l])=>(<button key={v} onClick={()=>setSourceFilter(v)}
+          style={{padding:'6px 12px',background:sourceFilter===v?C.pr:'#fff',color:sourceFilter===v?'#fff':C.t2,border:'none',cursor:'pointer',fontSize:12,fontWeight:600}}>{l}</button>))}
+      </div>
+      <div style={{fontSize:12,color:C.t3,marginLeft:'auto'}}>{filtered.length} registros · <strong style={{color:C.o,fontSize:14}}>${fN(totalFiltered)}</strong></div>
+      <button style={bSm(C.gL,C.g,C.gT)} onClick={()=>exportCSV(filtered.map(e=>({Fecha:e.date,Origen:e.source==='compra'?'Compra':'Operativo',Categoría:e.category,Descripción:e.description,MontoUSD:f2(e.amount_usd),Estado:e.source==='compra'?(e.is_credit?(e.is_paid?'Crédito pagado':'Pendiente'):'Contado'):'—'})),'gastos.csv')}>⬇ CSV</button>
     </div>
 
-    {/* Category summary */}
-    {Object.keys(byCategory).length>0&&(<div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(170px,1fr))',gap:10,marginBottom:16}}>
-      {Object.entries(byCategory).sort((a,b)=>b[1]-a[1]).map(([cat,amt])=>(<div key={cat} style={{...card({padding:14}),borderLeft:`3px solid ${C.o}`}}>
-        <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:'uppercase',marginBottom:4}}>{cat}</div>
-        <div style={{fontSize:20,fontWeight:800,color:C.o}}>${fN(amt)}</div>
-        {ves&&<div style={{fontSize:11,color:C.t3,marginTop:2}}>{ves.symbol}{fN(amt*ves.rate)}</div>}
-        <div style={{fontSize:11,color:C.t3}}>{f1(totalFiltered>0?amt/totalFiltered*100:0)}% del total</div>
-      </div>))}
-    </div>)}
+    {/* Resumen operativo vs compras */}
+    <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,marginBottom:16}}>
+      <div style={{...card({padding:14}),borderLeft:`3px solid ${C.o}`}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:'uppercase',marginBottom:4}}>⚡ Gastos Operativos</div>
+        <div style={{fontSize:22,fontWeight:900,color:C.o}}>${fN(totalOperativo)}</div>
+        {ves&&<div style={{fontSize:11,color:C.t3}}>Bs.{fN(totalOperativo*ves.rate)}</div>}
+      </div>
+      <div style={{...card({padding:14}),borderLeft:`3px solid ${C.b}`}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:'uppercase',marginBottom:4}}>🏭 Compras a Proveedores</div>
+        <div style={{fontSize:22,fontWeight:900,color:C.b}}>${fN(totalCompras)}</div>
+        {totalPendiente>0&&<div style={{fontSize:11,color:C.a,fontWeight:600}}>⏳ ${fN(totalPendiente)} pendiente</div>}
+      </div>
+      <div style={{...card({padding:14}),borderLeft:`3px solid ${C.r}`,background:C.rL}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.t3,textTransform:'uppercase',marginBottom:4}}>Total {mode==='caja'?'Salida Caja':'Devengado'}</div>
+        <div style={{fontSize:22,fontWeight:900,color:C.r}}>${fN(totalFiltered)}</div>
+        {ves&&<div style={{fontSize:11,color:C.t3}}>Bs.{fN(totalFiltered*ves.rate)}</div>}
+      </div>
+    </div>
 
     <div style={card({padding:0,overflow:'hidden'})}>
       <table style={{width:'100%',borderCollapse:'collapse'}}>
-        <thead><tr><th style={TH}>Fecha</th><th style={TH}>Categoría</th><th style={TH}>Descripción</th><th style={{...TH,textAlign:'right'}}>Monto USD</th><th style={{...TH,textAlign:'right'}}>En Bs.</th><th style={{...TH,textAlign:'center'}}>Acciones</th></tr></thead>
+        <thead><tr><th style={TH}>Fecha</th><th style={TH}>Origen</th><th style={TH}>Categoría</th><th style={TH}>Descripción</th><th style={{...TH,textAlign:'right'}}>Monto USD</th><th style={{...TH,textAlign:'right'}}>En Bs.</th><th style={{...TH,textAlign:'center'}}>Acciones</th></tr></thead>
         <tbody>
-          {paged.length===0?<tr><td colSpan={6}><EmptyState icon="💸" title="Sin gastos" sub="Registra el primer gasto operativo"/></td></tr>
-          :paged.map(e=>(<tr key={e.id}>
+          {paged.length===0?<tr><td colSpan={7}><EmptyState icon="💸" title="Sin gastos" sub="No hay gastos en el período seleccionado"/></td></tr>
+          :paged.map(e=>(<tr key={e.id} style={{opacity:e.source==='compra'&&e.is_credit&&!e.is_paid?0.75:1}}>
             <td style={TD}>{e.date}</td>
-            <td style={TD}><Badge txt={e.category} color={C.o}/></td>
+            <td style={TD}>{e.source==='compra'
+              ?<Badge txt={e.is_credit?(e.is_paid?'🏭 Compra ✓':'🏭 Compra ⏳'):'🏭 Compra'} color={e.is_credit&&!e.is_paid?C.a:C.b}/>
+              :<Badge txt="⚡ Operativo" color={C.o}/>}</td>
+            <td style={TD}><Badge txt={e.category} color={e.source==='compra'?C.b:C.o}/></td>
             <td style={{...TD,color:C.t2}}>{e.description}</td>
-            <td style={{...TD,textAlign:'right',fontWeight:700,color:C.o}}>${fN(e.amount_usd)}</td>
+            <td style={{...TD,textAlign:'right',fontWeight:700,color:e.source==='compra'?C.b:C.o}}>${fN(e.amount_usd)}</td>
             <td style={{...TD,textAlign:'right',color:C.t3,fontSize:12}}>{ves?`${ves.symbol}${fN(e.amount_usd*ves.rate)}`:'—'}</td>
             <td style={{...TD,textAlign:'center'}}>
-              <div style={{display:'flex',gap:5,justifyContent:'center'}}>
-                <button style={bSm(C.prL,C.pr,C.prT)} onClick={()=>openEdit(e)}>Editar</button>
-                <button style={bDgr} onClick={()=>{if(confirm('¿Eliminar este gasto?'))dispatch({type:'DEL_EXPENSE',id:e.id});}}>✕</button>
-              </div>
+              {e.source==='operativo'
+                ?<div style={{display:'flex',gap:5,justifyContent:'center'}}>
+                    <button style={bSm(C.prL,C.pr,C.prT)} onClick={()=>openEdit(st.expenses.find(x=>x.id===e.orig_id))}>Editar</button>
+                    <button style={bDgr} onClick={()=>{if(confirm('¿Eliminar este gasto?'))dispatch({type:'DEL_EXPENSE',id:e.orig_id});}}>✕</button>
+                  </div>
+                :<span style={{fontSize:11,color:C.t3,fontStyle:'italic'}}>ver en Compras</span>}
             </td>
           </tr>))}
         </tbody>
         {paged.length>0&&(<tfoot><tr style={{background:'#FAFBFD',fontWeight:700}}>
-          <td style={TD} colSpan={3}>TOTAL ({filtered.length} registros)</td>
-          <td style={{...TD,textAlign:'right',color:C.o,fontSize:15}}>${fN(totalFiltered)}</td>
+          <td style={TD} colSpan={4}>TOTAL ({filtered.length} registros)</td>
+          <td style={{...TD,textAlign:'right',color:C.r,fontSize:15}}>${fN(totalFiltered)}</td>
           <td style={TD} colSpan={2}/>
         </tr></tfoot>)}
       </table>
@@ -2365,6 +2945,210 @@ function Empleados({st,dispatch}){
         <div><label style={lbl}>Salario mensual (USD)</label><input type="number" step="0.01" style={inp} value={editing.salary_usd||''} onChange={e=>setEditing(x=>({...x,salary_usd:e.target.value}))} placeholder="0.00"/></div>
         <div><label style={lbl}>Estado</label><select style={sel} value={editing.status||'activo'} onChange={e=>setEditing(x=>({...x,status:e.target.value}))}><option value="activo">Activo</option><option value="inactivo">Inactivo</option><option value="vacaciones">Vacaciones</option><option value="licencia">Licencia</option></select></div>
         <div style={{gridColumn:'1/-1'}}><label style={lbl}>Notas</label><input style={inp} value={editing.notes||''} onChange={e=>setEditing(x=>({...x,notes:e.target.value}))} placeholder="Habilidades, turno, observaciones..."/></div>
+      </div>
+    </Modal>)}
+  </div>);
+}
+
+// ── CUENTAS POR COBRAR ────────────────────────────────────────────────
+function CuentasCobrar({st,dispatch}){
+  const[filter,setFilter]=useState('pending'); // pending|overdue|paid|all
+  const[search,setSearch]=useState('');
+  const[payModal,setPayModal]=useState(null); // sale object being paid
+  const[payForm,setPayForm]=useState({amount:'',method_id:'cash_usd',notes:''});
+  const[ToastEl,showToast]=useToast();
+  const vesRate=Object.values(st.currencies||{}).find(c=>c.code==='VES')?.rate||1;
+  const isUSD=id=>id==='cash_usd';
+
+  // Todas las ventas a crédito
+  const creditSales=(st.sales||[]).filter(s=>s.credit&&(s.sale_type==='credit'||s.sale_type==='wholesale_credit'));
+  const today=todayISO();
+  const enriched=creditSales.map(s=>{
+    const owed=s.credit?.amount_owed||0;
+    const isSettled=owed<0.01||s.credit?.settled_at;
+    const isOverdue=!isSettled&&s.credit?.due_date&&s.credit.due_date<today;
+    const daysOverdue=isOverdue?Math.floor((new Date(today)-new Date(s.credit.due_date))/(1000*60*60*24)):0;
+    return{...s,owed,isSettled,isOverdue,daysOverdue};
+  });
+  const filtered=enriched.filter(s=>{
+    if(filter==='pending'&&s.isSettled)return false;
+    if(filter==='overdue'&&(s.isSettled||!s.isOverdue))return false;
+    if(filter==='paid'&&!s.isSettled)return false;
+    if(search){
+      const q=search.toLowerCase();
+      if(!s.client?.toLowerCase().includes(q)&&!s.id.toLowerCase().includes(q))return false;
+    }
+    return true;
+  });
+
+  const totalPending=enriched.filter(s=>!s.isSettled).reduce((a,s)=>a+s.owed,0);
+  const totalOverdue=enriched.filter(s=>!s.isSettled&&s.isOverdue).reduce((a,s)=>a+s.owed,0);
+  const totalSettledMonth=enriched.filter(s=>s.isSettled&&s.credit?.settled_at?.startsWith(thisMonth())).reduce((a,s)=>a+s.total_usd,0);
+  const clientBalances={};
+  enriched.filter(s=>!s.isSettled).forEach(s=>{
+    if(!s.client_id)return;
+    if(!clientBalances[s.client_id])clientBalances[s.client_id]={name:s.client,total:0,count:0};
+    clientBalances[s.client_id].total+=s.owed;
+    clientBalances[s.client_id].count++;
+  });
+  const topDebtors=Object.entries(clientBalances).sort((a,b)=>b[1].total-a[1].total).slice(0,5);
+
+  function openPay(sale){
+    setPayModal(sale);
+    const nativeDefault=isUSD('cash_usd')?String(Math.ceil(sale.owed)):String(Math.ceil(sale.owed*vesRate));
+    setPayForm({amount:nativeDefault,method_id:'cash_usd',notes:'',date:today});
+  }
+  function confirmPay(){
+    const nativeAmt=Number(payForm.amount||0);
+    if(nativeAmt<=0){showToast('Ingresa un monto');return;}
+    const usdAmt=isUSD(payForm.method_id)?nativeAmt:nativeAmt/vesRate;
+    if(usdAmt>payModal.owed+0.01){showToast('El monto excede la deuda');return;}
+    const pm=(st.payment_methods||[]).find(x=>x.id===payForm.method_id);
+    dispatch({type:'CREDIT_PAYMENT',sale_id:payModal.id,payment:{
+      id:uid(),date:payForm.date||today,
+      amount_usd:usdAmt,
+      amount_native:nativeAmt,
+      currency:isUSD(payForm.method_id)?'USD':'VES',
+      method_id:payForm.method_id,method_name:pm?.name||payForm.method_id,
+      rate_used:vesRate,notes:payForm.notes,
+    }});
+    showToast(`Cobro registrado: $${fN(usdAmt)}`);
+    setPayModal(null);
+  }
+
+  return(<div>{ToastEl}
+    <PageHeader title="Cuentas por Cobrar" sub="Ventas a crédito y cobros pendientes"/>
+
+    {/* KPIs */}
+    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:16}}>
+      <KPICard label="Total Pendiente" value={`$${fN(totalPending)}`} sub={`${enriched.filter(s=>!s.isSettled).length} facturas`} icon="💳" color={C.a}/>
+      <KPICard label="Vencidas" value={`$${fN(totalOverdue)}`} sub={`${enriched.filter(s=>!s.isSettled&&s.isOverdue).length} facturas`} icon="⚠" color={C.r}/>
+      <KPICard label="Cobrado este mes" value={`$${fN(totalSettledMonth)}`} sub="facturas saldadas" icon="✓" color={C.g}/>
+      <KPICard label="Clientes con deuda" value={Object.keys(clientBalances).length} sub="con saldo abierto" icon="👥" color={C.b}/>
+    </div>
+
+    {/* Top deudores */}
+    {topDebtors.length>0&&(<div style={{...card({padding:14}),marginBottom:16}}>
+      <div style={{fontWeight:700,fontSize:13,marginBottom:8}}>🎯 Principales Deudores</div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        {topDebtors.map(([id,d])=>(<div key={id} style={{padding:'8px 12px',background:C.aL,border:`1.5px solid ${C.a}55`,borderRadius:8}}>
+          <div style={{fontSize:12,fontWeight:700,color:C.t1}}>{d.name}</div>
+          <div style={{fontSize:15,fontWeight:800,color:C.a}}>${fN(d.total)}</div>
+          <div style={{fontSize:10,color:C.t3}}>{d.count} factura{d.count>1?'s':''}</div>
+        </div>))}
+      </div>
+    </div>)}
+
+    {/* Filtros */}
+    <div style={{...card(),padding:'12px 14px',marginBottom:16,display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+      <div style={{position:'relative',flex:'1 1 240px',minWidth:200,maxWidth:400}}>
+        <span style={{position:'absolute',left:11,top:'50%',transform:'translateY(-50%)',fontSize:14,color:C.t3,pointerEvents:'none'}}>🔍</span>
+        <input style={{...inp,paddingLeft:34}} placeholder="Buscar cliente o factura..." value={search} onChange={e=>setSearch(e.target.value)}/>
+      </div>
+      <div style={{display:'flex',borderRadius:8,border:`1.5px solid ${C.bd}`,overflow:'hidden'}}>
+        {[['pending','Pendientes'],['overdue','Vencidas'],['paid','Pagadas'],['all','Todas']].map(([v,l])=>(
+          <button key={v} onClick={()=>setFilter(v)} style={{padding:'6px 14px',background:filter===v?C.pr:'#fff',color:filter===v?'#fff':C.t2,border:'none',cursor:'pointer',fontSize:12,fontWeight:600}}>{l}</button>
+        ))}
+      </div>
+      <span style={{fontSize:12,color:C.t3,marginLeft:'auto'}}>{filtered.length} resultado{filtered.length!==1?'s':''}</span>
+    </div>
+
+    {/* Tabla de créditos */}
+    <div style={card({padding:0,overflow:'hidden'})}>
+      <table style={{width:'100%',borderCollapse:'collapse'}}>
+        <thead><tr>
+          <th style={TH}>Fecha</th><th style={TH}>Cliente</th>
+          <th style={{...TH,textAlign:'right'}}>Total</th>
+          <th style={{...TH,textAlign:'right'}}>Abonado</th>
+          <th style={{...TH,textAlign:'right'}}>Debe</th>
+          <th style={TH}>Vencimiento</th>
+          <th style={{...TH,textAlign:'center'}}>Estado</th>
+          <th style={{...TH,textAlign:'center'}}>Acciones</th>
+        </tr></thead>
+        <tbody>
+          {filtered.length===0?<tr><td colSpan={8}><EmptyState icon="💳" title="Sin cuentas por cobrar" sub={filter==='pending'?'Todas las ventas a crédito están saldadas':filter==='overdue'?'No hay facturas vencidas':'No hay resultados con estos filtros'}/></td></tr>
+          :filtered.map(s=>{
+            const paid=s.total_usd-s.owed;
+            return(<tr key={s.id} style={{background:s.isOverdue&&!s.isSettled?C.rL+'55':'inherit'}}>
+              <td style={{...TD,fontSize:12}}>{s.date}<div style={{fontSize:10,color:C.t3}}>#{s.id.slice(-6)}</div></td>
+              <td style={{...TD,fontWeight:600}}>{s.client}</td>
+              <td style={{...TD,textAlign:'right',fontWeight:700}}>${fN(s.total_usd)}</td>
+              <td style={{...TD,textAlign:'right',color:C.g,fontWeight:600}}>${fN(paid)}</td>
+              <td style={{...TD,textAlign:'right',fontWeight:900,color:s.isSettled?C.g:s.isOverdue?C.r:C.a,fontSize:15}}>${fN(s.owed)}</td>
+              <td style={{...TD,fontSize:12}}>
+                {s.credit?.due_date||'—'}
+                {s.isOverdue&&<div style={{fontSize:10,color:C.r,fontWeight:700}}>+{s.daysOverdue}d vencida</div>}
+              </td>
+              <td style={{...TD,textAlign:'center'}}>
+                {s.isSettled?<Badge txt="✓ Saldado" color={C.g}/>
+                  :s.isOverdue?<Badge txt="⚠ Vencida" color={C.r}/>
+                  :paid>0?<Badge txt="Parcial" color={C.a}/>
+                  :<Badge txt="Pendiente" color={C.b}/>}
+              </td>
+              <td style={{...TD,textAlign:'center'}}>
+                {!s.isSettled&&<button style={bSm(C.gL,C.g,C.gT)} onClick={()=>openPay(s)}>💰 Cobrar</button>}
+              </td>
+            </tr>);
+          })}
+        </tbody>
+      </table>
+    </div>
+
+    {/* Modal de cobro */}
+    {payModal&&(<Modal title={`Cobro: ${payModal.client}`} onClose={()=>setPayModal(null)} width={480}
+      footer={<><button style={bSc} onClick={()=>setPayModal(null)}>Cancelar</button><button style={bPr} onClick={confirmPay}>✓ Registrar Cobro</button></>}>
+      <div style={{marginBottom:14,padding:12,background:C.aL,borderRadius:8}}>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:12,marginBottom:3}}>
+          <span style={{color:C.t2}}>Factura:</span>
+          <span style={{fontFamily:'monospace',fontWeight:700}}>#{payModal.id.slice(-6)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:12,marginBottom:3}}>
+          <span style={{color:C.t2}}>Total factura:</span>
+          <span style={{fontWeight:700}}>${fN(payModal.total_usd)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:12,marginBottom:3}}>
+          <span style={{color:C.t2}}>Abonado hasta ahora:</span>
+          <span style={{color:C.g,fontWeight:700}}>${fN(payModal.total_usd-payModal.owed)}</span>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',fontSize:14,marginTop:5,paddingTop:5,borderTop:`1px solid ${C.a}44`}}>
+          <span style={{fontWeight:700}}>Debe:</span>
+          <span style={{fontWeight:900,color:C.r,fontSize:16}}>${fN(payModal.owed)}</span>
+        </div>
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        <div>
+          <label style={lbl}>Fecha del cobro</label>
+          <input type="date" style={inp} value={payForm.date||today} onChange={e=>setPayForm(f=>({...f,date:e.target.value}))}/>
+        </div>
+        <div>
+          <label style={lbl}>Método de pago</label>
+          <select style={sel} value={payForm.method_id} onChange={e=>{
+            const newMethod=e.target.value;
+            const nativeDefault=isUSD(newMethod)?String(Math.ceil(payModal.owed)):String(Math.ceil(payModal.owed*vesRate));
+            setPayForm(f=>({...f,method_id:newMethod,amount:nativeDefault}));
+          }}>
+            {(st.payment_methods||[]).map(pm=><option key={pm.id} value={pm.id}>{pm.name} ({isUSD(pm.id)?'$':'Bs'})</option>)}
+          </select>
+        </div>
+      </div>
+      <div style={{marginTop:10}}>
+        <label style={lbl}>Monto ({isUSD(payForm.method_id)?'USD':'Bolívares'})</label>
+        <div style={{position:'relative'}}>
+          <span style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',fontSize:12,color:C.t3,fontWeight:700}}>{isUSD(payForm.method_id)?'$':'Bs.'}</span>
+          <input type="number" step="1" min="0" style={{...inp,paddingLeft:30,fontSize:16,fontWeight:800}} value={payForm.amount} onChange={e=>{
+            const clean=e.target.value.replace(/[^\d]/g,'');
+            setPayForm(f=>({...f,amount:clean}));
+          }}/>
+        </div>
+        <div style={{fontSize:11,color:C.t3,marginTop:4}}>
+          {isUSD(payForm.method_id)
+            ?`≈ Bs.${fN(Number(payForm.amount||0)*vesRate)}`
+            :`≈ $${fN(Number(payForm.amount||0)/vesRate)}`}
+        </div>
+      </div>
+      <div style={{marginTop:10}}>
+        <label style={lbl}>Notas (opcional)</label>
+        <input style={inp} value={payForm.notes} onChange={e=>setPayForm(f=>({...f,notes:e.target.value}))} placeholder="Recibo #, referencia..."/>
       </div>
     </Modal>)}
   </div>);
@@ -2773,6 +3557,7 @@ export default function App(){
     inventario:<Inventario st={st} dispatch={dispatch}/>,
     caja:<CuadreCaja st={st} dispatch={dispatch}/>,
     gastos:<Gastos st={st} dispatch={dispatch}/>,
+    cobros:<CuentasCobrar st={st} dispatch={dispatch}/>,
     reportes:<Reportes st={st}/>,
     clientes:<Clientes st={st} dispatch={dispatch}/>,
     empleados:<Empleados st={st} dispatch={dispatch}/>,
